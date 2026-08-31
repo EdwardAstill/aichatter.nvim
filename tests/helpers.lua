@@ -60,6 +60,10 @@ function M.symlink(target, path)
   assert(vim.loop.fs_symlink(target, path))
 end
 
+function M.chmod(path, mode)
+  assert(vim.uv.fs_chmod(path, mode))
+end
+
 function M.fake_transport(responses)
   local listeners = {}
   local transport = { responded = {} }
