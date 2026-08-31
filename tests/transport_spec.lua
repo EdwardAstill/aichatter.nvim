@@ -49,7 +49,12 @@ h.test("uses an injected process launcher and scheduler", function()
   end)
 
   h.eq("this-command-must-not-run", launched.cmd[1])
-  h.eq("initialize", vim.json.decode(writes[1]).method)
+  local initialize = vim.json.decode(writes[1])
+  h.eq("initialize", initialize.method)
+  h.eq({
+    clientInfo = { name = "aichatter.nvim", version = "0.1.0" },
+    capabilities = { experimentalApi = true },
+  }, initialize.params)
   launched.opts.stdout(nil, '{"id":1,"result":{}}\n')
   h.eq(nil, started)
   h.eq("initialized", vim.json.decode(writes[2]).method)

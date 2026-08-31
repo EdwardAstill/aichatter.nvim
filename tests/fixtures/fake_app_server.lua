@@ -35,22 +35,13 @@ local function valid_thread_start(params)
   return params.ephemeral == true
     and type(params.cwd) == "string"
     and params.approvalPolicy == "untrusted"
-    and params.sandbox == "workspace-write"
+    and params.permissions == ":workspace"
 end
 
 local function valid_turn_start(params)
-  local policy = params.sandboxPolicy
   return params.threadId == thread_id
     and type(params.input) == "table"
-    and type(policy) == "table"
-    and policy.type == "workspaceWrite"
-    and vim.deep_equal(policy.writableRoots, { thread_cwd })
-    and vim.deep_equal(policy.readOnlyAccess, {
-      type = "restricted",
-      includePlatformDefaults = true,
-      readableRoots = { thread_cwd },
-    })
-    and policy.networkAccess == false
+    and params.sandboxPolicy == nil
 end
 
 local function crash_marker()
@@ -105,7 +96,7 @@ for line in io.lines() do
     end
   elseif message.method == "turn/start" then
     if not valid_turn_start(message.params) then
-      reject(message, "invalid restricted sandbox policy")
+      reject(message, "invalid inherited permission profile")
     elseif scenario == "unsupported-sandbox" then
       reject(message, "unknown field `readOnlyAccess`")
     else

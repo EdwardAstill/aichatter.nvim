@@ -220,6 +220,7 @@ function Transport:start(callback)
   self.process = process_or_err
   self:request("initialize", {
     clientInfo = { name = "aichatter.nvim", version = "0.1.0" },
+    capabilities = { experimentalApi = true },
   }, function(err)
     if err then
       callback(err)

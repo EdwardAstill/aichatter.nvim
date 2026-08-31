@@ -579,7 +579,7 @@ function Session:_start_thread(generation, operation, opts)
     ephemeral = true,
     cwd = self.shadow.workspace_root,
     approvalPolicy = "untrusted",
-    sandbox = "workspace-write",
+    permissions = ":workspace",
   }
   local completed = once(function(err, result)
     if not self:_generation_current(generation) then return end
@@ -797,19 +797,6 @@ function Session:login(callback)
   if not ok then logged_in(error_value(thrown)) end
 end
 
-function Session:_turn_policy()
-  return {
-    type = "workspaceWrite",
-    writableRoots = { self.shadow.workspace_root },
-    readOnlyAccess = {
-      type = "restricted",
-      includePlatformDefaults = true,
-      readableRoots = { self.shadow.workspace_root },
-    },
-    networkAccess = false,
-  }
-end
-
 function Session:send(text, callback)
   callback = public_callback(callback)
   if self:_reject_reentry(callback) then return end
@@ -876,7 +863,6 @@ function Session:send(text, callback)
     local params = {
       threadId = self.thread_id,
       input = inputs,
-      sandboxPolicy = self:_turn_policy(),
     }
     local ok, thrown = pcall(self.transport.request, self.transport,
       "turn/start", params, completed)

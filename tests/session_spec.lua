@@ -184,7 +184,7 @@ h.test("clears one-shot context only after a successful turn start", function()
   h.eq(1, #success_context:inputs("Next"))
 end)
 
-h.test("sends the exact restricted v2 turn payload", function()
+h.test("inherits the thread permission profile instead of overriding turn sandbox reads", function()
   local fixture = h.session_fixture()
 
   fixture.session:send("Edit safely")
@@ -192,16 +192,6 @@ h.test("sends the exact restricted v2 turn payload", function()
   h.eq({
     threadId = "thread-1",
     input = { { type = "text", text = "Edit safely" } },
-    sandboxPolicy = {
-      type = "workspaceWrite",
-      writableRoots = { "/shadow/workspace" },
-      readOnlyAccess = {
-        type = "restricted",
-        includePlatformDefaults = true,
-        readableRoots = { "/shadow/workspace" },
-      },
-      networkAccess = false,
-    },
   }, requests(fixture.transport, "turn/start")[1].params)
 end)
 
@@ -350,7 +340,7 @@ h.test("aborts conflicted live synchronization and emits affected paths", functi
   h.eq({ "a.lua", "b.lua" }, fixture.events[1].value.paths)
 end)
 
-h.test("fails with the exact upgrade diagnostic without weakening sandbox policy", function()
+h.test("fails with the exact upgrade diagnostic without retrying a rejected turn", function()
   local fixture = h.session_fixture({
     responses = {
       ["turn/start"] = function(_, callback)
@@ -365,8 +355,7 @@ h.test("fails with the exact upgrade diagnostic without weakening sandbox policy
   h.eq("Codex CLI is too old for aichatter.nvim; upgrade Codex and retry.", captured.message)
   h.eq("failed", fixture.session.state)
   h.eq(1, #requests(fixture.transport, "turn/start"))
-  h.eq("restricted",
-    requests(fixture.transport, "turn/start")[1].params.sandboxPolicy.readOnlyAccess.type)
+  h.eq(nil, requests(fixture.transport, "turn/start")[1].params.sandboxPolicy)
 end)
 
 h.test("starts transport then auth then shadow then one ephemeral thread", function()
@@ -423,7 +412,7 @@ h.test("starts transport then auth then shadow then one ephemeral thread", funct
     ephemeral = true,
     cwd = "/tmp/session/workspace",
     approvalPolicy = "untrusted",
-    sandbox = "workspace-write",
+    permissions = ":workspace",
   }, requests(transport, "thread/start")[1].params)
 end)
 
@@ -1210,8 +1199,7 @@ h.test("stops a live failed transport before retrying after a CLI upgrade", func
   h.eq("idle", fixture.session.state)
   fixture.session:send("After upgrade")
   local turns = requests(fixture.transport, "turn/start")
-  h.eq("restricted", turns[#turns].params.sandboxPolicy.readOnlyAccess.type)
-  h.eq(false, turns[#turns].params.sandboxPolicy.networkAccess)
+  h.eq(nil, turns[#turns].params.sandboxPolicy)
 end)
 
 h.test("fake app-server supports authenticated and account-required startup", function()
