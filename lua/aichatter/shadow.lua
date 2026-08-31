@@ -28,19 +28,34 @@ local function new(dependencies)
   local Shadow = {}
   Shadow.__index = Shadow
 
+  local function translate_root_alias(project_root, root_alias, value)
+    value = path.normalize(value)
+    if root_alias and (value == root_alias or path.is_within(root_alias, value)) then
+      local relative = path.relative(root_alias, value)
+      if relative == "." then
+        return project_root
+      end
+      return project_root .. "/" .. relative
+    end
+    return value
+  end
+
   local function default_run(argv, callback)
     return vim.system(argv, { text = true }, function(result)
       callback(nil, result)
     end)
   end
 
-  local function default_buffer_provider(root)
+  local function default_buffer_provider(root, root_alias)
     local buffers = {}
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       local name = vim.api.nvim_buf_get_name(bufnr)
       if vim.api.nvim_buf_is_loaded(bufnr) and name ~= "" then
         name = path.normalize(name)
-        if name ~= root and path.is_within(root, name) then
+        local under_root = name ~= root and path.is_within(root, name)
+        local under_alias = root_alias and name ~= root_alias
+          and path.is_within(root_alias, name)
+        if under_root or under_alias then
           local bytes = table.concat(
             vim.api.nvim_buf_get_lines(bufnr, 0, -1, false),
             "\n"
@@ -210,7 +225,7 @@ local function new(dependencies)
   end
 
   function Shadow:_buffers(exclude)
-    local ok, buffers = pcall(self._buffer_provider, self.project_root)
+    local ok, buffers = pcall(self._buffer_provider, self.project_root, self._root_alias)
     if not ok then
       return nil, error_value(buffers)
     end
@@ -223,7 +238,11 @@ local function new(dependencies)
         or type(buffer.bytes) ~= "string" then
         return nil, { message = "buffer_provider returned an invalid buffer" }
       end
-      local buffer_path = path.normalize(buffer.path)
+      local buffer_path = translate_root_alias(
+        self.project_root,
+        self._root_alias,
+        buffer.path
+      )
       if buffer_path == self.project_root or not path.is_within(self.project_root, buffer_path) then
         return nil, { message = "buffer outside project root: " .. buffer_path }
       end
@@ -300,13 +319,13 @@ local function new(dependencies)
     self:_overlay_buffers({}, callback or function() end)
   end
 
-  local function normalized_exclusions(project_root, exclude_paths)
+  local function normalized_exclusions(project_root, root_alias, exclude_paths)
     local result = { [".git"] = true }
     for value, excluded in pairs(exclude_paths or {}) do
       if excluded then
         local relative = value
         if value:sub(1, 1) == "/" then
-          local absolute = path.normalize(value)
+          local absolute = translate_root_alias(project_root, root_alias, value)
           if path.is_within(project_root, absolute) and absolute ~= project_root then
             relative = path.relative(project_root, absolute)
           else
@@ -330,7 +349,11 @@ local function new(dependencies)
       callback({ code = "cancelled", message = "shadow work cancelled" })
       return
     end
-    local exclude = normalized_exclusions(self.project_root, exclude_paths)
+    local exclude = normalized_exclusions(
+      self.project_root,
+      self._root_alias,
+      exclude_paths
+    )
     self:_copy(self.project_root, self.workspace_root, {
       exclude = exclude,
       overlay = true,
@@ -369,7 +392,8 @@ local function new(dependencies)
   function Shadow.create(opts, callback)
     opts = opts or {}
     callback = once(callback or function() end)
-    local located_root = path.project_root(assert(opts.root, "root is required"))
+    local root_alias = path.normalize(assert(opts.root, "root is required"))
+    local located_root = path.project_root(root_alias)
     local root, root_err = real_project_root(located_root)
     if not root then
       callback(root_err)
@@ -386,6 +410,7 @@ local function new(dependencies)
       baseline_root = session_root .. "/control/baseline",
       workspace_root = session_root .. "/workspace",
       project_root = root,
+      _root_alias = root_alias,
       _temp_parent = temp_parent,
       _buffer_provider = opts.buffer_provider or default_buffer_provider,
       _active = 0,

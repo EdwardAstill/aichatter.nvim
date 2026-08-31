@@ -125,18 +125,22 @@ h.test("preserves symlinks in workspace and metadata-free baseline", function()
 end)
 
 h.test("rejects buffer paths through symlink ancestors without changing external bytes", function()
-  local root = h.tempdir()
+  local parent = h.tempdir()
+  local root = parent .. "/actual"
+  local alias = parent .. "/alias"
   local outside = h.tempdir()
+  h.mkdir(root)
   h.write(outside .. "/victim.txt", "external\n")
   h.symlink(outside, root .. "/linked")
+  h.symlink(root, alias)
 
   local err, shadow = wait_result(function(callback)
     Shadow.create({
-      root = root,
+      root = alias,
       temp_parent = h.tempdir(),
       buffer_provider = function()
         return {
-          { path = root .. "/linked/victim.txt", bytes = "overwritten\n", mode = 420 },
+          { path = alias .. "/linked/victim.txt", bytes = "overwritten\n", mode = 420 },
         }
       end,
     }, callback)
@@ -162,6 +166,62 @@ h.test("resolves a symlinked project root before mirroring", function()
   h.eq("directory", uv.fs_lstat(shadow.workspace_root).type)
   h.eq("directory", uv.fs_lstat(shadow.baseline_root).type)
   h.eq("return 1\n", h.read(shadow.workspace_root .. "/main.lua"))
+end)
+
+h.test("overlays a loaded unsaved buffer named through the project root alias", function()
+  local parent = h.tempdir()
+  local actual = parent .. "/actual"
+  local alias = parent .. "/alias"
+  h.mkdir(actual)
+  h.write(actual .. "/note.txt", "disk\n")
+  h.symlink(actual, alias)
+  local bufnr = vim.fn.bufadd(actual .. "/note.txt")
+  vim.fn.bufload(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "unsaved alias" })
+  vim.bo[bufnr].endofline = false
+  vim.bo[bufnr].modified = true
+  local get_name = vim.api.nvim_buf_get_name
+  vim.api.nvim_buf_get_name = function(current)
+    if current == bufnr then
+      return alias .. "/note.txt"
+    end
+    return get_name(current)
+  end
+
+  local created, shadow = xpcall(function()
+    return h.create_shadow(alias)
+  end, debug.traceback)
+  vim.api.nvim_buf_get_name = get_name
+  assert(created, shadow)
+
+  h.eq("unsaved alias", h.read(shadow.workspace_root .. "/note.txt"))
+  h.eq("unsaved alias", h.read(shadow.baseline_root .. "/note.txt"))
+  h.eq("disk\n", h.read(actual .. "/note.txt"))
+  h.truthy(vim.bo[bufnr].modified)
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end)
+
+h.test("retains an absolute excluded proposal named through the project root alias", function()
+  local parent = h.tempdir()
+  local actual = parent .. "/actual"
+  local alias = parent .. "/alias"
+  h.mkdir(actual)
+  h.write(actual .. "/proposal.txt", "shadow proposal\n")
+  h.write(actual .. "/ordinary.txt", "old\n")
+  h.symlink(actual, alias)
+  local shadow = h.create_shadow(alias)
+  h.write(actual .. "/proposal.txt", "live proposal\n")
+  h.write(actual .. "/ordinary.txt", "fresh\n")
+
+  local err = wait_error(function(callback)
+    shadow:sync_live({ [alias .. "/proposal.txt"] = true }, callback)
+  end)
+
+  h.eq(nil, err)
+  for _, destination in ipairs({ shadow.workspace_root, shadow.baseline_root }) do
+    h.eq("shadow proposal\n", h.read(destination .. "/proposal.txt"))
+    h.eq("fresh\n", h.read(destination .. "/ordinary.txt"))
+  end
 end)
 
 h.test("sync_live updates both trees while retaining excluded proposals", function()
