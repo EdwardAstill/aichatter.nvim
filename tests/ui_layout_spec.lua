@@ -94,6 +94,119 @@ h.test("composed UI hides an empty queue and removes event handlers", function()
   h.falsy(ui.layout)
 end)
 
+h.test("prompts once for a command approval that arrived while hidden", function()
+  local fixture = h.session_fixture({
+    state = "running",
+    turn_id = "turn-1",
+    files = {},
+  })
+  local prompts = {}
+  local ui = require("aichatter.ui").new(fixture.session, {
+    ui_select = function(items, opts, callback)
+      prompts[#prompts + 1] = { items = items, opts = opts, callback = callback }
+    end,
+  })
+  ui:open()
+  ui:toggle()
+
+  fixture.transport:server_request(51, "item/commandExecution/requestApproval", {
+    threadId = "thread-1",
+    turnId = "turn-1",
+    itemId = "command-1",
+  })
+  h.eq(0, #prompts)
+  h.truthy(fixture.session.pending_commands[51])
+
+  ui:open()
+  ui:open()
+  h.eq(1, #prompts)
+  h.eq({ "Approve once", "Decline" }, prompts[1].items)
+  prompts[1].callback("Approve once")
+  h.eq({ decision = "accept" }, fixture.transport.responses[51].result)
+  h.eq(nil, fixture.session.pending_commands[51])
+  ui:close()
+end)
+
+h.test("reconciles an open diff and clean candidate after a refreshed turn", function()
+  local review = h.fake_review({
+    path = "main.lua",
+    base = "old\n",
+    candidate = "first\n",
+  })
+  local session = {
+    state = "reviewable",
+    transcript = {},
+    context = { files = {}, selections = {} },
+    review = review,
+    emit = function() end,
+  }
+  function session:send() end
+  local ui = require("aichatter.ui").new(session, {})
+  ui:open()
+  ui:_open_review(review.record)
+  local view = ui.diff_view
+  h.invoke_mapping(view.bufnr, "n", "e")
+  local candidate = view.candidate_bufnr
+  vim.api.nvim_win_set_buf(view.winid, view.bufnr)
+  vim.api.nvim_set_current_win(view.winid)
+
+  review.record.candidate = "second\n"
+  review.record.hunks = require("aichatter.diff").hunks(
+    review.record.base, review.record.candidate)
+  session.emit("state", "reviewable")
+
+  h.matches("%+second", h.buffer_text(view.bufnr))
+  h.invoke_mapping(view.bufnr, "n", "e")
+  h.eq({ "second" }, vim.api.nvim_buf_get_lines(candidate, 0, -1, false))
+  h.falsy(vim.b[candidate].aichatter_stale)
+  ui:close()
+end)
+
+h.test("preserves and marks a modified candidate after an errored queue mutation", function()
+  local review = h.fake_review({
+    path = "main.lua",
+    base = "old\n",
+    candidate = "first\n",
+  })
+  function review:accept_file(_, callback)
+    self.record.candidate = "queue latest\n"
+    self.record.status = "conflict"
+    self.record.hunks = require("aichatter.diff").hunks(
+      self.record.base, self.record.candidate)
+    callback({ message = "accept failed after refresh" })
+  end
+  local session = {
+    state = "reviewable",
+    transcript = {},
+    context = { files = {}, selections = {} },
+    review = review,
+    emit = function() end,
+  }
+  function session:send() end
+  local ui = require("aichatter.ui").new(session, {})
+  ui:open()
+  ui:_open_review(review.record)
+  local view = ui.diff_view
+  h.invoke_mapping(view.bufnr, "n", "e")
+  local candidate = view.candidate_bufnr
+  vim.api.nvim_buf_set_lines(candidate, 0, -1, false, { "local draft" })
+  vim.bo[candidate].modified = true
+  vim.api.nvim_win_set_buf(view.winid, view.bufnr)
+
+  ui:_review_action("accept_file", review.record)
+
+  h.eq({ "local draft" }, vim.api.nvim_buf_get_lines(candidate, 0, -1, false))
+  h.truthy(vim.bo[candidate].modified)
+  h.truthy(vim.b[candidate].aichatter_stale)
+  local warning = vim.inspect(vim.api.nvim_buf_get_extmarks(
+    candidate, view.candidate_namespace, 0, -1, { details = true }))
+  h.matches(":write replaces", warning)
+  h.matches("%+queue latest", h.buffer_text(view.bufnr))
+  h.matches("%[conflict%]", h.buffer_text(ui.changes.bufnr))
+  h.matches("accept failed after refresh", h.buffer_text(ui.transcript.bufnr))
+  ui:close()
+end)
+
 h.test("rejects tiny screens without leaking windows buffers or focus", function()
   dimensions(20, 5, function()
     local main_win = vim.api.nvim_get_current_win()

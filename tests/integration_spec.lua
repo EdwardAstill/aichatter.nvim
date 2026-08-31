@@ -127,9 +127,37 @@ h.test("composes sidebar shadow turn hunk review and confirmed cleanup end to en
     return h.buffer_text(live) ==
       "one codex\nkeep two\nthree unsaved\nkeep four\nfive unsaved"
   end, 3000))
+  h.eq("one codex\nkeep two\nthree codex\nkeep four\nfive unsaved\n",
+    h.read(isolated .. "/workspace/main.lua"))
   h.eq("one disk\nkeep two\nthree disk\nkeep four\nfive disk\n",
     h.read(root .. "/main.lua"))
   h.truthy(vim.bo[live].modified)
+
+  h.invoke_mapping(diff_buf, "n", "e")
+  local candidate = assert(buffer("aichatter-candidate"), "candidate buffer not found")
+  vim.api.nvim_buf_set_lines(candidate, 0, -1, false, {
+    "one codex", "keep two", "three edited", "keep four", "five unsaved",
+  })
+  vim.bo[candidate].endofline = true
+  vim.bo[candidate].modified = true
+  vim.api.nvim_set_current_buf(candidate)
+  vim.cmd("write")
+  h.truthy(h.wait_for(function()
+    return h.buffer_text(diff_buf):find("+three edited", 1, true) ~= nil
+      and vim.api.nvim_get_current_buf() == diff_buf
+  end, 3000))
+  h.eq("one codex\nkeep two\nthree edited\nkeep four\nfive unsaved\n",
+    h.read(isolated .. "/workspace/main.lua"))
+  h.invoke_mapping(diff_buf, "n", "[c")
+  local hunk_line = vim.api.nvim_win_get_cursor(0)[1]
+  h.matches("^@@", vim.api.nvim_buf_get_lines(
+    diff_buf, hunk_line - 1, hunk_line, false)[1])
+  h.invoke_mapping(diff_buf, "n", "]c")
+  h.eq(hunk_line, vim.api.nvim_win_get_cursor(0)[1])
+  h.eq("one codex\nkeep two\nthree unsaved\nkeep four\nfive unsaved",
+    h.buffer_text(live))
+  h.eq("one disk\nkeep two\nthree disk\nkeep four\nfive disk\n",
+    h.read(root .. "/main.lua"))
 
   local selected
   local old_select = vim.ui.select
@@ -253,27 +281,43 @@ h.test("adds only contained regular files and exact visual lines", function()
     ["main.lua"] = "one\ntwo\nthree\n",
     ["lua/extra.lua"] = "return 1\n",
   })
+  local external = h.tempdir()
+  h.write(external .. "/secret.lua", "return 'secret'\n")
+  h.symlink(external, root .. "/link")
   local live = h.load_buffer(root .. "/main.lua", { "one", "two", "three" }, false)
   vim.api.nvim_set_current_buf(live)
   configure(root, "authenticated")
   vim.cmd("AIChat")
   h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
   vim.cmd("AIChatAddFile lua/extra.lua")
-  vim.api.nvim_set_current_buf(live)
-  vim.fn.setpos("'<", { live, 2, 1, 0 })
-  vim.fn.setpos("'>", { live, 3, 1, 0 })
-  vim.cmd("AIChatAddSelection")
+  local function add_visual(keys)
+    vim.api.nvim_set_current_buf(live)
+    vim.api.nvim_feedkeys(
+      vim.keycode(keys .. ":AIChatAddSelection<CR>"), "xt", false)
+    vim.wait(50)
+  end
+  add_visual("ggVj")
+  add_visual("2gg0vj$")
+  add_visual("gg0<C-v>2j$")
   local composer = assert(buffer("aichatter-composer"))
   local rendered = vim.inspect(vim.api.nvim_buf_get_extmarks(
     composer, -1, 0, -1, { details = true }))
   h.matches("@lua/extra.lua", rendered)
+  h.matches("main.lua:1%-2", rendered)
   h.matches("main.lua:2%-3", rendered)
+  h.matches("main.lua:1%-3", rendered)
 
   local notified
   local old_notify = vim.notify
   vim.notify = function(message) notified = message end
   vim.cmd("AIChatAddFile ../outside.lua")
   h.matches("outside project root", notified)
+  notified = nil
+  vim.cmd("AIChatAddFile link/secret.lua")
+  h.matches("symlink", notified or "")
+  rendered = vim.inspect(vim.api.nvim_buf_get_extmarks(
+    composer, -1, 0, -1, { details = true }))
+  h.falsy(rendered:find("@link/secret.lua", 1, true))
   vim.notify = old_notify
 
   local offered

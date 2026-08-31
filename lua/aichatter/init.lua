@@ -60,9 +60,23 @@ local function regular_file(root, value)
   if absolute == root or not path.is_within(root, absolute) then
     error("context path is outside project root", 0)
   end
-  local stat = (vim.uv or vim.loop).fs_lstat(absolute)
-  if not stat or stat.type ~= "file" then
-    error("context path is not a regular project file: " .. value, 0)
+  local uv = vim.uv or vim.loop
+  local current = root
+  local relative = path.relative(root, absolute)
+  local components = {}
+  for component in relative:gmatch("[^/]+") do
+    components[#components + 1] = component
+  end
+  for index, component in ipairs(components) do
+    current = current .. "/" .. component
+    local stat = uv.fs_lstat(current)
+    if stat and stat.type == "link" then
+      error("context path traverses a symlink: " .. value, 0)
+    end
+    local expected = index == #components and "file" or "directory"
+    if not stat or stat.type ~= expected then
+      error("context path is not a regular project file: " .. value, 0)
+    end
   end
   return absolute
 end
@@ -140,20 +154,24 @@ function M.add_file(value)
   end)
 end
 
-function M.add_selection()
+function M.add_selection(command)
+  command = command or {}
   with_context(function(active)
-    local first = vim.fn.getpos("'<")
-    local last = vim.fn.getpos("'>")
-    local bufnr = first[1] ~= 0 and first[1] or vim.api.nvim_get_current_buf()
-    local last_bufnr = last[1] ~= 0 and last[1] or bufnr
-    if bufnr ~= last_bufnr or not vim.api.nvim_buf_is_valid(bufnr)
-        or first[2] < 1 or last[2] < first[2] then
+    local first, last = vim.fn.getpos("'<"), vim.fn.getpos("'>")
+    local ranged = (command.range or 0) > 0
+    local bufnr = ranged and command.bufnr
+      or (first[1] ~= 0 and first[1] or vim.api.nvim_get_current_buf())
+    local last_bufnr = ranged and bufnr or (last[1] ~= 0 and last[1] or bufnr)
+    local first_line = ranged and command.line1 or first[2]
+    local last_line = ranged and command.line2 or last[2]
+    if bufnr ~= last_bufnr or not bufnr or not vim.api.nvim_buf_is_valid(bufnr)
+        or first_line < 1 or last_line < first_line then
       error("AIChatAddSelection requires valid visual marks in one buffer", 0)
     end
     local name = vim.api.nvim_buf_get_name(bufnr)
     if name == "" then error("selected buffer must have a project file name", 0) end
-    local lines = vim.api.nvim_buf_get_lines(bufnr, first[2] - 1, last[2], false)
-    active.session.context:add_selection(name, first[2], last[2], lines)
+    local lines = vim.api.nvim_buf_get_lines(bufnr, first_line - 1, last_line, false)
+    active.session.context:add_selection(name, first_line, last_line, lines)
     active.ui:render()
   end)
 end
@@ -207,9 +225,11 @@ function M._register_commands()
     complete = "file",
     desc = "Add a project file to AI Chatter context",
   })
-  vim.api.nvim_create_user_command("AIChatAddSelection", protected(function()
-    M.add_selection()
+  vim.api.nvim_create_user_command("AIChatAddSelection", protected(function(command)
+    command.bufnr = vim.api.nvim_get_current_buf()
+    M.add_selection(command)
   end), {
+    range = true,
     desc = "Add the last visual selection to AI Chatter context",
   })
   vim.api.nvim_create_user_command("AIChatCancel", protected(function() M.cancel() end), {

@@ -45,8 +45,14 @@ function UI:_review_action(method, file)
   review[method](review, file.path, function(err)
     if not self:_active(generation) then return end
     self:_report_error(err, generation)
-    if not err then self:render(generation) end
+    self:_reconcile_review(generation)
   end)
+end
+
+function UI:_reconcile_review(generation)
+  if not self:_active(generation) then return end
+  if self.diff_view then self.diff_view:reconcile() end
+  self:render_changes()
 end
 
 function UI:_open_review(file)
@@ -83,19 +89,32 @@ function UI:_command_approval(value)
   local generation = self.generation
   local request_id = value and value.requestId
   if not request_id then return end
+  if self.approval_prompts[request_id] then return end
+  self.approval_prompts[request_id] = true
   local select = self.opts.ui_select or vim.ui.select
   select({ "Approve once", "Decline" }, {
     prompt = "Codex command requires approval",
   }, function(choice)
-    if not self:_active(generation) or not choice then return end
+    if not self:_active(generation) then return end
+    if not choice then
+      self.approval_prompts[request_id] = nil
+      return
+    end
     local decision = choice == "Approve once" and "accept" or "decline"
     local ok, err = self.session:approve_command(request_id, decision)
     if not ok then self:_report_error(err, generation) end
   end)
 end
 
+function UI:_reconcile_command_approvals()
+  for request_id in pairs(self.session.pending_commands or {}) do
+    self:_command_approval({ requestId = request_id })
+  end
+end
+
 function UI:_make_views()
   self.generation = (self.generation or 0) + 1
+  self.approval_prompts = {}
   local generation = self.generation
   local mappings = self.opts.mappings or {}
   self.transcript = Transcript.new({ schedule = self.opts.schedule })
@@ -136,8 +155,12 @@ function UI:_event(name, value)
     self.transcript:render(self.session.transcript or {})
   end
   self.composer:render(self.session.context or {})
-  if name == "state" then self:_render_state() end
-  if name == "state" or name == "turn/completed" then self:render_changes() end
+  if name == "state" then
+    self:_render_state()
+    self:_reconcile_review()
+  elseif name == "turn/completed" then
+    self:render_changes()
+  end
   if name == "item/commandExecution/requestApproval" then
     self:_command_approval(value)
   end
@@ -223,6 +246,7 @@ function UI:open()
   self.composer.winid = self.layout.composer_win
   self:render()
   self:_render_state()
+  self:_reconcile_command_approvals()
   return self
 end
 

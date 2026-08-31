@@ -24,6 +24,10 @@ local function buffer_bytes(bufnr)
   return bytes
 end
 
+local function actionable(hunk)
+  return hunk.status ~= "accepted" and hunk.status ~= "rejected"
+end
+
 function View:_notify(err)
   self.notify(error_message(err), vim.log.levels.ERROR, { title = "aichatter.nvim" })
 end
@@ -82,7 +86,7 @@ function View:render(preferred_hunk)
   else
     for _, hunk in ipairs(record.hunks or {}) do
       self:_render_hunk(lines, record, hunk)
-      if hunk.status == nil or hunk.status == "pending" then
+      if actionable(hunk) then
         self.pending_hunks[#self.pending_hunks + 1] = hunk
       end
     end
@@ -112,6 +116,48 @@ function View:render(preferred_hunk)
   end
 end
 
+function View:_mark_candidate_stale(bufnr)
+  vim.b[bufnr].aichatter_stale = true
+  vim.api.nvim_buf_clear_namespace(bufnr, self.candidate_namespace, 0, -1)
+  vim.api.nvim_buf_set_extmark(bufnr, self.candidate_namespace, 0, 0, {
+    virt_lines = { {
+      { "AI Chatter: proposal changed; local draft preserved. :write replaces the shadow candidate.",
+        "WarningMsg" },
+    } },
+    virt_lines_above = true,
+  })
+end
+
+function View:_sync_candidate()
+  local bufnr = self.candidate_bufnr
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
+  local record = self.record
+  if vim.bo[bufnr].modified then
+    if record and not record.binary and buffer_bytes(bufnr) == (record.candidate or "") then
+      vim.b[bufnr].aichatter_stale = nil
+      vim.api.nvim_buf_clear_namespace(bufnr, self.candidate_namespace, 0, -1)
+    else
+      self:_mark_candidate_stale(bufnr)
+    end
+    return
+  end
+  if not record or record.binary then
+    self:_mark_candidate_stale(bufnr)
+    return
+  end
+  local parsed = diff.lines(record.candidate or "")
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, parsed.lines)
+  vim.bo[bufnr].endofline = parsed.endofline
+  vim.bo[bufnr].modified = false
+  vim.b[bufnr].aichatter_stale = nil
+  vim.api.nvim_buf_clear_namespace(bufnr, self.candidate_namespace, 0, -1)
+end
+
+function View:reconcile(preferred_hunk)
+  self:render(preferred_hunk)
+  self:_sync_candidate()
+end
+
 function View:_current_hunk()
   local winid = self.winid
   if not winid or not vim.api.nvim_win_is_valid(winid)
@@ -120,7 +166,7 @@ function View:_current_hunk()
   end
   local line = vim.api.nvim_win_get_cursor(winid)[1]
   local hunk = self.line_to_hunk[line]
-  if hunk and (hunk.status == nil or hunk.status == "pending") then return hunk end
+  if hunk and actionable(hunk) then return hunk end
   return self.pending_hunks[1]
 end
 
@@ -145,13 +191,14 @@ function View:_decide(method)
   local id = hunk.id
   self.review[method](self.review, self.path, id, function(err)
     if self.closed then return end
-    if err then self:_notify(err); return end
-    self:render(id)
+    self:reconcile(id)
     self.on_change()
+    if err then self:_notify(err) end
   end)
 end
 
 function View:_open_candidate()
+  self:reconcile()
   if not self.record or self.record.binary then return end
   if self.candidate_bufnr and vim.api.nvim_buf_is_valid(self.candidate_bufnr) then
     vim.api.nvim_set_current_buf(self.candidate_bufnr)
@@ -169,12 +216,15 @@ function View:_open_candidate()
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, parsed.lines)
   vim.bo[bufnr].endofline = parsed.endofline
   vim.bo[bufnr].modified = false
+  vim.b[bufnr].aichatter_stale = nil
 
   vim.api.nvim_create_autocmd("BufWriteCmd", {
     buffer = bufnr,
     callback = function()
       if self.closed or self.candidate_writing then return end
       self.candidate_writing = true
+      local generation = self.generation
+      local origin_win = self.winid
       local bytes = buffer_bytes(bufnr)
       self.review:edit_candidate(self.path, bytes, function(err)
         self.candidate_writing = false
@@ -182,11 +232,13 @@ function View:_open_candidate()
         if err then self:_notify(err); return end
         local unchanged = buffer_bytes(bufnr) == bytes
         if unchanged then vim.bo[bufnr].modified = false end
-        self:render()
+        self:reconcile()
         self.on_change()
-        if unchanged and self.winid and vim.api.nvim_win_is_valid(self.winid) then
-          vim.api.nvim_win_set_buf(self.winid, self.bufnr)
-          vim.api.nvim_set_current_win(self.winid)
+        if unchanged and generation == self.generation
+            and origin_win == vim.api.nvim_get_current_win()
+            and vim.api.nvim_win_is_valid(origin_win)
+            and vim.api.nvim_win_get_buf(origin_win) == bufnr then
+          vim.api.nvim_win_set_buf(origin_win, self.bufnr)
         end
       end)
     end,
@@ -198,6 +250,7 @@ end
 function View:close()
   if self.closed then return end
   self.closed = true
+  self.generation = self.generation + 1
   for _, bufnr in ipairs({ self.candidate_bufnr, self.bufnr }) do
     if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
       pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
@@ -239,9 +292,11 @@ function M.open(review, relative, opts)
     bufnr = bufnr,
     winid = winid,
     namespace = vim.api.nvim_create_namespace("aichatter-diff-" .. bufnr),
+    candidate_namespace = vim.api.nvim_create_namespace("aichatter-candidate-" .. bufnr),
     context_lines = opts.context_lines or 3,
     notify = opts.notify or vim.notify,
     on_change = opts.on_change or function() end,
+    generation = 1,
     closed = false,
   }, View)
   vim.keymap.set("n", mappings.previous_hunk, function() self:_move(-1) end,
