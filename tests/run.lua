@@ -8,8 +8,21 @@ else
   table.sort(specs)
 end
 
+local load_failed = false
 for _, spec in ipairs(specs) do
-  dofile(spec)
+  local ok, err = xpcall(function()
+    dofile(spec)
+  end, debug.traceback)
+  if not ok then
+    load_failed = true
+    print("FAIL " .. spec)
+    print(err)
+  end
+end
+
+if load_failed then
+  vim.cmd("cquit 1")
+  return
 end
 
 require("tests.helpers").run()

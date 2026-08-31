@@ -16,6 +16,9 @@ function Transport.new(opts)
     pending = {},
     listeners = {},
     stderr = "",
+    launcher = opts.launcher or vim.system,
+    scheduler = opts.scheduler or vim.schedule,
+    defer = opts.defer or vim.defer_fn,
   }, Transport)
 
   self.parser = jsonl.new(function(message)
@@ -28,7 +31,7 @@ function Transport.new(opts)
 end
 
 function Transport:_schedule(callback)
-  vim.schedule(callback)
+  self.scheduler(callback)
 end
 
 function Transport:_write(message)
@@ -108,7 +111,7 @@ function Transport:start(callback)
     return
   end
 
-  local ok, process_or_err = pcall(vim.system, self.cmd, {
+  local ok, process_or_err = pcall(self.launcher, self.cmd, {
     stdin = true,
     text = true,
     stdout = function(_, chunk)
@@ -219,7 +222,7 @@ function Transport:stop(callback)
   end
 
   self.process:write(nil)
-  vim.defer_fn(function()
+  self.defer(function()
     if self.process and not self.process:is_closing() then
       self.process:kill("sigterm")
     end
