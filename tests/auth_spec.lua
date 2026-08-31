@@ -110,6 +110,32 @@ h.test("reports a failed browser-open result", function()
   h.matches("browser unavailable", login_error.message)
 end)
 
+h.test("reports a nil-result browser-open error and cleans up", function()
+  local calls, login_errors = 0, {}
+  local transport = h.fake_transport({
+    ["account/login/start"] = { loginId = "login-1", authUrl = "https://chatgpt.com/auth" },
+  })
+  local auth = Auth.new(transport, {
+    open_url = function()
+      return nil, "browser unavailable"
+    end,
+  })
+
+  auth:login(function(err)
+    calls = calls + 1
+    login_errors[#login_errors + 1] = err
+  end)
+  transport:emit("account/login/completed", { loginId = "login-1", success = true })
+  auth:login(function(err)
+    calls = calls + 1
+    login_errors[#login_errors + 1] = err
+  end)
+
+  h.eq(2, calls)
+  h.matches("browser unavailable", login_errors[1].message)
+  h.matches("browser unavailable", login_errors[2].message)
+end)
+
 h.test("cleans up after a cancelled login", function()
   local calls, login_error = 0
   local transport = h.fake_transport({

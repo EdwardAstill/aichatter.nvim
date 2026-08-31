@@ -85,6 +85,8 @@ function Auth:login(callback)
       self:_finish_login(state, { message = open_result })
     elseif open_result == false then
       self:_finish_login(state, { message = open_err or "failed to open login URL" })
+    elseif open_result == nil and open_err ~= nil then
+      self:_finish_login(state, { message = open_err })
     end
   end)
 end
