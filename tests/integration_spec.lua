@@ -1,0 +1,289 @@
+local h = require("tests.helpers")
+
+local aichatter = require("aichatter")
+local original_cwd = assert((vim.uv or vim.loop).cwd())
+local fake_server = original_cwd .. "/tests/fixtures/fake_app_server.lua"
+
+local function fake_command(scenario)
+  return {
+    vim.v.progpath, "--headless", "-u", "NONE", "-l",
+    fake_server, scenario,
+  }
+end
+
+local function buffers(filetype)
+  local found = {}
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(bufnr) and vim.bo[bufnr].filetype == filetype then
+      found[#found + 1] = bufnr
+    end
+  end
+  return found
+end
+
+local function buffer(filetype)
+  local found = buffers(filetype)
+  return found[#found]
+end
+
+local function window_for(bufnr)
+  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.api.nvim_win_get_buf(winid) == bufnr then return winid end
+  end
+end
+
+local function status_is(state)
+  local bufnr = buffer("aichatter-transcript")
+  local winid = bufnr and window_for(bufnr)
+  return winid and vim.wo[winid].statusline:find(state, 1, true) ~= nil
+end
+
+local function session_root(temp_parent)
+  local matches = vim.fn.glob(temp_parent .. "/aichatter-*", false, true)
+  return #matches == 1 and matches[1] or nil
+end
+
+local function configure(root, scenario)
+  vim.cmd("cd " .. vim.fn.fnameescape(root))
+  aichatter.setup({ codex_cmd = fake_command(scenario) })
+end
+
+local function submit(text)
+  local bufnr = assert(buffer("aichatter-composer"), "composer buffer not found")
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { text })
+  h.invoke_mapping(bufnr, "i", "<CR>")
+end
+
+local function close_chat()
+  vim.cmd("AIChatClose")
+  h.truthy(h.wait_for(function()
+    return #buffers("aichatter-composer") == 0
+  end, 3000))
+  vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
+end
+
+h.test("composes sidebar shadow turn hunk review and confirmed cleanup end to end", function()
+  local root = h.git_project({
+    ["main.lua"] = "one disk\nkeep two\nthree disk\nkeep four\nfive disk\n",
+  })
+  local live = h.load_buffer(root .. "/main.lua", {
+    "one unsaved", "keep two", "three unsaved", "keep four", "five unsaved",
+  }, true)
+  vim.api.nvim_set_current_buf(live)
+  local temp_parent = h.tempdir()
+  local exit_marker = temp_parent .. "/fake-exited"
+  local old_tmpdir = vim.env.TMPDIR
+  local old_exit_marker = vim.env.AICHATTER_FAKE_EXIT_MARKER
+  vim.env.TMPDIR = temp_parent
+  vim.env.AICHATTER_FAKE_EXIT_MARKER = exit_marker
+  configure(root, "e2e-turn")
+
+  local initial_windows = #vim.api.nvim_tabpage_list_wins(0)
+  vim.cmd("AIChat")
+  h.eq(initial_windows + 2, #vim.api.nvim_tabpage_list_wins(0))
+  h.eq(1, #buffers("aichatter-transcript"))
+  h.eq(1, #buffers("aichatter-changes"))
+  h.eq(1, #buffers("aichatter-composer"))
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+
+  submit("change main.lua")
+  local transcript = assert(buffer("aichatter-transcript"))
+  local changes = assert(buffer("aichatter-changes"))
+  h.truthy(h.wait_for(function()
+    return h.buffer_text(transcript):find("streamed proposal", 1, true) ~= nil
+  end, 3000))
+  h.eq("", h.buffer_text(changes))
+  h.eq("one disk\nkeep two\nthree disk\nkeep four\nfive disk\n",
+    h.read(root .. "/main.lua"))
+  h.eq("one unsaved\nkeep two\nthree unsaved\nkeep four\nfive unsaved",
+    h.buffer_text(live))
+
+  local isolated = assert(session_root(temp_parent), "session directory not found")
+  h.write(isolated .. "/control/release-turn", "release\n")
+  h.truthy(h.wait_for(function()
+    return h.buffer_text(changes):find("main.lua", 1, true) ~= nil
+      and status_is("reviewable")
+  end, 5000))
+  h.eq("one disk\nkeep two\nthree disk\nkeep four\nfive disk\n",
+    h.read(root .. "/main.lua"))
+  h.eq("one unsaved\nkeep two\nthree unsaved\nkeep four\nfive unsaved",
+    h.buffer_text(live))
+
+  vim.api.nvim_set_current_win(assert(window_for(changes)))
+  h.invoke_mapping(changes, "n", "o")
+  local diff_buf = assert(buffer("aichatter-diff"), "diff buffer not found")
+  local namespace = assert(vim.api.nvim_get_namespaces()["aichatter-diff-" .. diff_buf])
+  local extmarks = vim.api.nvim_buf_get_extmarks(
+    diff_buf, namespace, 0, -1, { details = true })
+  h.truthy(h.has_highlight(extmarks, "AIChatterDiffDelete"))
+  h.truthy(h.has_highlight(extmarks, "AIChatterDiffAdd"))
+  h.invoke_mapping(diff_buf, "n", "a")
+  h.truthy(h.wait_for(function()
+    return h.buffer_text(live):find("one codex", 1, true) ~= nil
+  end, 3000))
+  h.invoke_mapping(diff_buf, "n", "]c")
+  h.invoke_mapping(diff_buf, "n", "r")
+  h.truthy(h.wait_for(function()
+    return h.buffer_text(live) ==
+      "one codex\nkeep two\nthree unsaved\nkeep four\nfive unsaved"
+  end, 3000))
+  h.eq("one disk\nkeep two\nthree disk\nkeep four\nfive disk\n",
+    h.read(root .. "/main.lua"))
+  h.truthy(vim.bo[live].modified)
+
+  local selected
+  local old_select = vim.ui.select
+  vim.ui.select = function(items, _, callback)
+    selected = items
+    callback(nil)
+  end
+  vim.cmd("AIChatClose")
+  vim.wait(50)
+  h.truthy(vim.fn.isdirectory(isolated) == 1)
+  h.truthy(buffer("aichatter-composer") ~= nil)
+  vim.ui.select = function(items, _, callback)
+    selected = items
+    callback("Keep reviewing")
+  end
+  vim.cmd("AIChatClose")
+  vim.wait(50)
+  h.truthy(vim.fn.isdirectory(isolated) == 1)
+  h.truthy(buffer("aichatter-composer") ~= nil)
+  vim.ui.select = function(items, _, callback)
+    selected = items
+    callback("Discard pending changes")
+  end
+  vim.cmd("AIChatClose")
+  h.truthy(h.wait_for(function()
+    return vim.fn.isdirectory(isolated) == 0 and vim.fn.filereadable(exit_marker) == 1
+      and #buffers("aichatter-composer") == 0
+  end, 5000))
+  h.eq({ "Keep reviewing", "Discard pending changes" }, selected)
+  h.eq(0, #buffers("aichatter-composer"))
+  vim.ui.select = old_select
+  vim.env.TMPDIR = old_tmpdir
+  vim.env.AICHATTER_FAKE_EXIT_MARKER = old_exit_marker
+  vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
+end)
+
+h.test("opens the managed browser login URL without handling credentials", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  local opened
+  local old_open = vim.ui.open
+  vim.ui.open = function(url)
+    opened = url
+    return true
+  end
+  configure(root, "account-required")
+  vim.cmd("AIChatLogin")
+  h.truthy(h.wait_for(function() return opened ~= nil and status_is("idle") end, 5000))
+  h.eq("https://chatgpt.com/auth", opened)
+  vim.ui.open = old_open
+  close_chat()
+end)
+
+h.test("routes an explicit command approval decision through the sidebar", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  local selections = 0
+  local old_select = vim.ui.select
+  vim.ui.select = function(items, _, callback)
+    selections = selections + 1
+    h.eq({ "Approve once", "Decline" }, items)
+    callback("Approve once")
+  end
+  configure(root, "command-approval")
+  vim.cmd("AIChat")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+  submit("run tests")
+  h.truthy(h.wait_for(function()
+    local transcript = buffer("aichatter-transcript")
+    return transcript and h.buffer_text(transcript):find("Approval · decided", 1, true)
+      and status_is("idle")
+  end, 5000))
+  h.eq(1, selections)
+  vim.ui.select = old_select
+  close_chat()
+end)
+
+h.test("cancels one active turn through the public command", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  local temp_parent = h.tempdir()
+  local old_tmpdir = vim.env.TMPDIR
+  vim.env.TMPDIR = temp_parent
+  configure(root, "wait-for-cancel")
+  vim.cmd("AIChat")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+  submit("wait")
+  h.truthy(h.wait_for(function() return status_is("running") end, 3000))
+  vim.cmd("AIChatCancel")
+  local isolated
+  h.truthy(h.wait_for(function()
+    isolated = session_root(temp_parent)
+    return isolated and status_is("idle")
+  end, 5000))
+  h.truthy(vim.fn.filereadable(
+    isolated .. "/control/fake-app-server-interrupted") == 1)
+  close_chat()
+  vim.env.TMPDIR = old_tmpdir
+end)
+
+h.test("restarts the fake process once and preserves the visible session", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  local temp_parent = h.tempdir()
+  local old_tmpdir = vim.env.TMPDIR
+  vim.env.TMPDIR = temp_parent
+  configure(root, "crash-once")
+  vim.cmd("AIChat")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+  submit("crash once")
+  h.truthy(h.wait_for(function()
+    local isolated = session_root(temp_parent)
+    local transcript = buffer("aichatter-transcript")
+    return isolated and vim.fn.filereadable(
+      isolated .. "/control/fake-app-server-crashed") == 1
+      and transcript and h.buffer_text(transcript):find("exited unexpectedly", 1, true)
+      and status_is("idle")
+  end, 6000))
+  close_chat()
+  vim.env.TMPDIR = old_tmpdir
+end)
+
+h.test("adds only contained regular files and exact visual lines", function()
+  local root = h.git_project({
+    ["main.lua"] = "one\ntwo\nthree\n",
+    ["lua/extra.lua"] = "return 1\n",
+  })
+  local live = h.load_buffer(root .. "/main.lua", { "one", "two", "three" }, false)
+  vim.api.nvim_set_current_buf(live)
+  configure(root, "authenticated")
+  vim.cmd("AIChat")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+  vim.cmd("AIChatAddFile lua/extra.lua")
+  vim.api.nvim_set_current_buf(live)
+  vim.fn.setpos("'<", { live, 2, 1, 0 })
+  vim.fn.setpos("'>", { live, 3, 1, 0 })
+  vim.cmd("AIChatAddSelection")
+  local composer = assert(buffer("aichatter-composer"))
+  local rendered = vim.inspect(vim.api.nvim_buf_get_extmarks(
+    composer, -1, 0, -1, { details = true }))
+  h.matches("@lua/extra.lua", rendered)
+  h.matches("main.lua:2%-3", rendered)
+
+  local notified
+  local old_notify = vim.notify
+  vim.notify = function(message) notified = message end
+  vim.cmd("AIChatAddFile ../outside.lua")
+  h.matches("outside project root", notified)
+  vim.notify = old_notify
+
+  local offered
+  local old_select = vim.ui.select
+  vim.ui.select = function(items, _, callback)
+    offered = items
+    callback("main.lua")
+  end
+  vim.cmd("AIChatAddFile")
+  h.eq({ "lua/extra.lua", "main.lua" }, offered)
+  vim.ui.select = old_select
+  close_chat()
+end)

@@ -1,0 +1,125 @@
+*aichatter.txt*      Shadow-safe Codex chat and hunk review for Neovim
+
+==============================================================================
+CONTENTS                                                    *aichatter-contents*
+
+1. Introduction ................................................ |aichatter|
+2. Requirements ....................................... |aichatter-requirements|
+3. Setup ................................................ |aichatter-setup|
+4. Commands ............................................ |aichatter-commands|
+5. Mappings ............................................ |aichatter-mappings|
+6. Safety and limitations ................................. |aichatter-safety|
+
+==============================================================================
+1. INTRODUCTION                                                *aichatter*
+
+aichatter.nvim runs complete Codex turns from a right sidebar. Codex works in
+an isolated shadow workspace. Proposed files become reviewable only after the
+turn completes, and the live project changes only when you accept a hunk or a
+whole-file proposal.
+
+The sidebar contains a transcript, a changed-file queue when proposals exist,
+and a multiline composer. Opening a proposal uses the normal editor area and
+renders a unified diff with red deletions and green additions.
+
+==============================================================================
+2. REQUIREMENTS                                      *aichatter-requirements*
+
+- Neovim 0.10 or newer. Linux CI runs Neovim 0.10.4.
+- A current Codex CLI with app-server ephemeral-thread and restricted-read
+  support.
+- Git for Git projects.
+- Linux or macOS. Native Windows is not supported in v1.
+
+Authenticate with `codex login` or |:AIChatLogin|. Codex owns stored
+credentials; aichatter.nvim does not read or write tokens.
+
+==============================================================================
+3. SETUP                                               *aichatter-setup*
+
+Call setup before the first command: >lua
+
+  require("aichatter").setup({
+    side = "right",
+    width = 0.35,
+    composer_height = 0.20,
+  })
+<
+
+The defaults are a right sidebar at 35% width and a composer at 20% height.
+Mappings may be replaced through the `mappings` setup table. No mandatory
+global mapping is installed.
+
+==============================================================================
+4. COMMANDS                                         *aichatter-commands*
+
+                                                        *:AIChat*
+:AIChat
+    Toggle the single chat sidebar. The session and UI are created lazily.
+
+                                                        *:AIChatLogin*
+:AIChatLogin
+    Start the Codex-managed ChatGPT browser login flow.
+
+                                                        *:AIChatAddFile*
+:AIChatAddFile [path]
+    Add a contained regular project file as one-shot context. With no path,
+    choose from regular project files through |vim.ui.select()|.
+
+                                                        *:AIChatAddSelection*
+:AIChatAddSelection
+    Add the exact full lines between the last `'<` and `'>` visual marks.
+
+                                                        *:AIChatCancel*
+:AIChatCancel
+    Interrupt the active Codex turn. Completed shadow edits remain reviewable.
+
+                                                        *:AIChatClose*
+:AIChatClose
+    Stop the app-server, close plugin views, discard in-memory conversation
+    state, and remove the validated temporary session directory. Pending
+    proposals require explicitly choosing "Discard pending changes".
+
+==============================================================================
+5. MAPPINGS                                         *aichatter-mappings*
+
+All defaults are buffer-local.
+
+Composer:
+  <CR>        Submit the prompt.
+  <C-j>       Insert a literal newline.
+
+Changed-file queue:
+  o           Open the file in unified hunk review.
+  a           Accept all pending changes in the file.
+  r           Reject all pending changes in the file.
+
+Unified hunk review:
+  [c          Move to the previous pending hunk.
+  ]c          Move to the next pending hunk.
+  a           Accept the current hunk.
+  r           Reject the current hunk.
+  e           Edit the complete candidate in a shadow-only acwrite buffer.
+
+==============================================================================
+6. SAFETY AND LIMITATIONS                              *aichatter-safety*
+
+The session owns a protected baseline and writable shadow workspace. Codex is
+started in the shadow with workspace-only writes, restricted reads, and network
+access disabled by default. File-change approval is automatic only for the
+disposable shadow; risky command requests require an explicit decision.
+
+Loaded buffer contents, including unsaved edits and final-newline state, are
+overlaid into the shadow without saving. Accepting into an unsaved loaded
+buffer leaves it modified and does not write its disk file. Candidate edit mode
+also changes only the shadow and never uses the live path as its buffer name.
+
+Closing with proposals is cancelled by the default/no selection and by "Keep
+reviewing". Only "Discard pending changes" proceeds. Accepted live edits stay.
+
+Version 1 has one active in-memory session, no persistent/browsable history,
+and no native Windows support. Linux is covered by CI. macOS remains a target
+subject to the release smoke test.
+
+==============================================================================
+vim:tw=78:ts=8:noet:ft=help:norl:

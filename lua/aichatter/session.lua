@@ -142,7 +142,7 @@ end
 function Session.new(deps)
   deps = deps or {}
   local transport = deps.transport or Transport.new()
-  local root = deps.root or assert((vim.uv or vim.loop).cwd())
+  local root = deps.root or path.project_root(assert((vim.uv or vim.loop).cwd()))
   local self = setmetatable({
     state = "closed",
     transport = transport,

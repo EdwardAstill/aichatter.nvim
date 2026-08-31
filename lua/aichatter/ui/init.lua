@@ -2,6 +2,7 @@ local Layout = require("aichatter.ui.layout")
 local Transcript = require("aichatter.ui.transcript")
 local Composer = require("aichatter.ui.composer")
 local Changes = require("aichatter.ui.changes")
+local Diff = require("aichatter.ui.diff")
 
 local UI = {}
 UI.__index = UI
@@ -48,6 +49,51 @@ function UI:_review_action(method, file)
   end)
 end
 
+function UI:_open_review(file)
+  if not self:_active() or not self.layout then return end
+  if self.diff_view then self.diff_view:close() end
+  local winid = self.layout.main_win
+  if not winid or not vim.api.nvim_win_is_valid(winid) then return end
+  vim.api.nvim_set_current_win(winid)
+  local ok, value = pcall(Diff.open, self.session.review, file.path, {
+    winid = winid,
+    mappings = self.opts.mappings,
+    notify = self.opts.notify or vim.notify,
+    on_change = function()
+      if self:_active() then self:render_changes() end
+    end,
+  })
+  if ok then
+    self.diff_view = value
+  else
+    self:_report_error({ message = tostring(value) })
+  end
+end
+
+function UI:_render_state()
+  self.state = self.session.state
+  if self.transcript and self.transcript.winid
+      and vim.api.nvim_win_is_valid(self.transcript.winid) then
+    vim.wo[self.transcript.winid].statusline =
+      " AIChatter · " .. tostring(self.state or "closed") .. " "
+  end
+end
+
+function UI:_command_approval(value)
+  local generation = self.generation
+  local request_id = value and value.requestId
+  if not request_id then return end
+  local select = self.opts.ui_select or vim.ui.select
+  select({ "Approve once", "Decline" }, {
+    prompt = "Codex command requires approval",
+  }, function(choice)
+    if not self:_active(generation) or not choice then return end
+    local decision = choice == "Approve once" and "accept" or "decline"
+    local ok, err = self.session:approve_command(request_id, decision)
+    if not ok then self:_report_error(err, generation) end
+  end)
+end
+
 function UI:_make_views()
   self.generation = (self.generation or 0) + 1
   local generation = self.generation
@@ -72,7 +118,7 @@ function UI:_make_views()
   })
   self.changes = Changes.new({
     mappings = mappings,
-    on_open = self.opts.on_open,
+    on_open = self.opts.on_open or function(file) self:_open_review(file) end,
     on_accept = self.opts.on_accept or function(file)
       self:_review_action("accept_file", file)
     end,
@@ -82,7 +128,7 @@ function UI:_make_views()
   })
 end
 
-function UI:_event(name)
+function UI:_event(name, value)
   if not self:_active() then return end
   if name == "item/agentMessage/delta" then
     self.transcript:schedule_render(self.session.transcript or {})
@@ -90,7 +136,11 @@ function UI:_event(name)
     self.transcript:render(self.session.transcript or {})
   end
   self.composer:render(self.session.context or {})
+  if name == "state" then self:_render_state() end
   if name == "state" or name == "turn/completed" then self:render_changes() end
+  if name == "item/commandExecution/requestApproval" then
+    self:_command_approval(value)
+  end
 end
 
 function UI:_bind()
@@ -172,6 +222,7 @@ function UI:open()
   self.changes.winid = self.layout.changes_win
   self.composer.winid = self.layout.composer_win
   self:render()
+  self:_render_state()
   return self
 end
 
@@ -188,6 +239,8 @@ function UI:close()
   self.closed = true
   self.generation = self.generation + 1
   self:_unbind()
+  if self.diff_view then self.diff_view:close() end
+  self.diff_view = nil
   if self.layout then self.layout:close() end
   self.transcript:close()
   self.changes:close()

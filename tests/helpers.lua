@@ -207,6 +207,72 @@ function M.review_fixture(base_bytes, candidate_bytes, opts)
   }
 end
 
+function M.fake_review(record)
+  record = record or {}
+  record.path = record.path or "main.lua"
+  record.base = record.base or ""
+  record.candidate = record.candidate or ""
+  record.base_exists = record.base_exists ~= false
+  record.candidate_exists = record.candidate_exists ~= false
+  record.binary = record.binary or false
+  record.file_level = record.file_level or false
+  record.hunks = record.hunks or require("aichatter.diff").hunks(
+    record.base, record.candidate)
+  for index, hunk in ipairs(record.hunks) do
+    hunk.id = hunk.id or index
+    hunk.status = hunk.status or "pending"
+  end
+
+  local review = {
+    record = record,
+    accepted_hunks = {},
+    rejected_hunks = {},
+    edited_candidates = {},
+  }
+
+  function review:files()
+    return { self.record }
+  end
+
+  function review:accept_hunk(path, id, callback)
+    M.eq(self.record.path, path)
+    self.accepted_hunks[#self.accepted_hunks + 1] = id
+    if callback then callback() end
+  end
+
+  function review:reject_hunk(path, id, callback)
+    M.eq(self.record.path, path)
+    self.rejected_hunks[#self.rejected_hunks + 1] = id
+    if callback then callback() end
+  end
+
+  function review:edit_candidate(path, bytes, callback)
+    M.eq(self.record.path, path)
+    self.edited_candidates[#self.edited_candidates + 1] = bytes
+    if self.edit_error then
+      callback(self.edit_error)
+      return
+    end
+    self.record.candidate = bytes
+    self.record.hunks = require("aichatter.diff").hunks(self.record.base, bytes)
+    for index, hunk in ipairs(self.record.hunks) do
+      hunk.id = index
+      hunk.status = "pending"
+    end
+    callback()
+  end
+
+  return review
+end
+
+function M.has_highlight(marks, group)
+  for _, mark in ipairs(marks or {}) do
+    local details = mark[4] or {}
+    if details.hl_group == group then return true end
+  end
+  return false
+end
+
 local function git(root, ...)
   local argv = { "git", "-C", root, ... }
   local result = vim.system(argv, { text = true }):wait()

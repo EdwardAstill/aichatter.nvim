@@ -1,0 +1,14 @@
+:AIChat	aichatter.txt	/*:AIChat*
+:AIChatAddFile	aichatter.txt	/*:AIChatAddFile*
+:AIChatAddSelection	aichatter.txt	/*:AIChatAddSelection*
+:AIChatCancel	aichatter.txt	/*:AIChatCancel*
+:AIChatClose	aichatter.txt	/*:AIChatClose*
+:AIChatLogin	aichatter.txt	/*:AIChatLogin*
+aichatter	aichatter.txt	/*aichatter*
+aichatter-commands	aichatter.txt	/*aichatter-commands*
+aichatter-contents	aichatter.txt	/*aichatter-contents*
+aichatter-mappings	aichatter.txt	/*aichatter-mappings*
+aichatter-requirements	aichatter.txt	/*aichatter-requirements*
+aichatter-safety	aichatter.txt	/*aichatter-safety*
+aichatter-setup	aichatter.txt	/*aichatter-setup*
+aichatter.txt	aichatter.txt	/*aichatter.txt*

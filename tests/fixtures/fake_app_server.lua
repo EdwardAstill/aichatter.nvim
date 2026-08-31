@@ -1,4 +1,5 @@
 local scenario = arg[#arg] or "initialize"
+local exit_marker = os.getenv("AICHATTER_FAKE_EXIT_MARKER")
 
 local function send(value)
   io.stdout:write(vim.json.encode(value) .. "\n")
@@ -54,6 +55,12 @@ end
 
 local function crash_marker()
   return vim.fs.dirname(thread_cwd) .. "/control/fake-app-server-crashed"
+end
+
+local function write_file(filename, bytes)
+  local file = assert(io.open(filename, "wb"))
+  file:write(bytes)
+  file:close()
 end
 
 io.stderr:write("fake app server started: " .. scenario .. "\n")
@@ -129,6 +136,35 @@ for line in io.lines() do
           item = { id = "item-1", type = "agentMessage" },
         })
         complete("completed")
+      elseif scenario == "e2e-turn" then
+        write_file(thread_cwd .. "/main.lua",
+          "one codex\nkeep two\nthree codex\nkeep four\nfive codex\n")
+        notify("item/started", {
+          threadId = thread_id,
+          turnId = turn_id,
+          item = { id = "item-e2e", type = "agentMessage" },
+        })
+        notify("item/agentMessage/delta", {
+          threadId = thread_id,
+          turnId = turn_id,
+          itemId = "item-e2e",
+          delta = "streamed proposal",
+        })
+        notify("item/completed", {
+          threadId = thread_id,
+          turnId = turn_id,
+          item = { id = "item-e2e", type = "agentMessage" },
+        })
+        local release = vim.fs.dirname(thread_cwd) .. "/control/release-turn"
+        if not vim.wait(5000, function()
+          local file = io.open(release, "rb")
+          if not file then return false end
+          file:close()
+          return true
+        end, 10) then
+          os.exit(32)
+        end
+        complete("completed")
       elseif scenario == "file-approval" then
         pending_approval = { id = 700, kind = "file" }
         send({
@@ -167,6 +203,12 @@ for line in io.lines() do
           created:close()
           os.exit(23)
         end
+      elseif scenario == "wait-for-cancel" then
+        notify("item/agentMessage/delta", {
+          threadId = thread_id,
+          turnId = turn_id,
+          delta = "waiting for cancellation",
+        })
       else
         complete("completed")
       end
@@ -179,10 +221,18 @@ for line in io.lines() do
     end
   elseif message.method == "turn/interrupt" then
     respond(message)
-    if turn_id then complete("interrupted") end
+    if turn_id then
+      if scenario == "wait-for-cancel" then
+        write_file(vim.fs.dirname(thread_cwd)
+          .. "/control/fake-app-server-interrupted", "interrupted\n")
+      end
+      complete("interrupted")
+    end
   elseif message.method == "never/respond" then
     -- Used by the transport stop test to leave one request pending.
   elseif message.id then
     reject(message, "unsupported fake method: " .. tostring(message.method))
   end
 end
+
+if exit_marker then write_file(exit_marker, "exited\n") end
