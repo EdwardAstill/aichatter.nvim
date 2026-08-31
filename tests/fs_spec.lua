@@ -3,6 +3,19 @@ local fs = require("aichatter.fs")
 
 local uv = vim.uv
 
+local function uv_with(overrides)
+  return setmetatable(overrides or {}, { __index = uv })
+end
+
+local function directory_entries(directory)
+  local entries = {}
+  for name in vim.fs.dir(directory) do
+    entries[#entries + 1] = name
+  end
+  table.sort(entries)
+  return entries
+end
+
 local function wait_for_callback(start)
   local calls, callback_error = 0
   start(function(err)
@@ -33,6 +46,36 @@ h.test("copies nested files and excludes .git directories", function()
   h.eq(nil, err)
   h.eq("return 1\n", h.read(target .. "/nested/a.lua"))
   h.eq(nil, uv.fs_lstat(target .. "/.git"))
+end)
+
+h.test("creates a missing destination parent hierarchy", function()
+  local source = h.tempdir()
+  local target_root = h.tempdir()
+  local target = target_root .. "/missing/parents/copy"
+  h.write(source .. "/a.lua", "return 1\n")
+
+  local err = wait_for_callback(function(cb)
+    fs.copy_tree(source, target, {}, cb)
+  end)
+
+  h.eq(nil, err)
+  h.eq("return 1\n", h.read(target .. "/a.lua"))
+end)
+
+h.test("refuses to create destination parents through a symlink", function()
+  local source = h.tempdir()
+  local target_root = h.tempdir()
+  local outside = h.tempdir()
+  local linked = target_root .. "/linked"
+  h.write(source .. "/a.lua", "return 1\n")
+  h.symlink(outside, linked)
+
+  local err = wait_for_callback(function(cb)
+    fs.copy_tree(source, linked .. "/missing/copy", {}, cb)
+  end)
+
+  h.matches("symlink ancestor", err.message)
+  h.eq(nil, uv.fs_lstat(outside .. "/missing"))
 end)
 
 h.test("recreates internal and external symlinks without traversing them", function()
@@ -70,52 +113,139 @@ h.test("preserves executable file mode", function()
   h.eq(493, bit.band(uv.fs_stat(target .. "/run.sh").mode, 511))
 end)
 
-h.test("reports progress and cancels a copy exactly once", function()
+h.test("yields at the batch boundary and cancels with an exact partial tree", function()
   local source = h.tempdir()
   local target = h.tempdir() .. "/copy"
   for index = 1, 140 do
     h.write(source .. string.format("/file-%03d", index), tostring(index))
   end
   local cancel = { cancelled = false }
-  local progress = {}
+  local scheduled = {}
+  local isolated = fs._new({
+    schedule = function(callback)
+      scheduled[#scheduled + 1] = callback
+    end,
+  })
+  local calls, callback_error = 0
 
-  local err = wait_for_callback(function(cb)
-    fs.copy_tree(source, target, {
-      cancel = cancel,
-      on_progress = function(count, relative)
-        progress[#progress + 1] = { count, relative }
-        if relative ~= "" then
-          cancel.cancelled = true
-        end
-      end,
-    }, cb)
+  isolated.copy_tree(source, target, { cancel = cancel }, function(err)
+    calls = calls + 1
+    callback_error = err
   end)
 
-  h.eq("cancelled", err.code)
-  h.truthy(#progress >= 1)
-  for index, item in ipairs(progress) do
-    h.eq(index, item[1])
-  end
-  h.truthy(#progress < 141)
+  h.eq(1, #scheduled)
+  table.remove(scheduled, 1)()
+  h.eq(0, calls)
+  h.eq(1, #scheduled)
+  cancel.cancelled = true
+  table.remove(scheduled, 1)()
+
+  h.eq(1, calls)
+  h.eq("cancelled", callback_error.code)
+  h.eq(127, #directory_entries(target))
+  h.truthy(uv.fs_lstat(target .. "/file-001"))
+  h.truthy(uv.fs_lstat(target .. "/file-127"))
+  h.eq(nil, uv.fs_lstat(target .. "/file-128"))
+  h.eq(nil, uv.fs_lstat(target .. "/file-140"))
 end)
 
 h.test("atomically replaces a file with the requested mode", function()
   local directory = h.tempdir()
   local target = directory .. "/state"
   h.write(target, "old")
+  local events = {}
+  local isolated = fs._new({
+    schedule = function(callback) callback() end,
+    uv = uv_with({
+      fs_write = function(...)
+        events[#events + 1] = "write"
+        return uv.fs_write(...)
+      end,
+      fs_fsync = function(...)
+        events[#events + 1] = "fsync"
+        return uv.fs_fsync(...)
+      end,
+      fs_close = function(...)
+        events[#events + 1] = "close"
+        return uv.fs_close(...)
+      end,
+      fs_chmod = function(...)
+        events[#events + 1] = "chmod"
+        return uv.fs_chmod(...)
+      end,
+      fs_rename = function(...)
+        events[#events + 1] = "rename"
+        return uv.fs_rename(...)
+      end,
+    }),
+  })
 
   local err = wait_for_callback(function(cb)
-    fs.atomic_write(target, "new bytes", 416, cb)
+    isolated.atomic_write(target, "new bytes", 416, cb)
   end)
 
   h.eq(nil, err)
   h.eq("new bytes", h.read(target))
   h.eq(416, bit.band(uv.fs_stat(target).mode, 511))
-  local entries = 0
-  for _ in vim.fs.dir(directory) do
-    entries = entries + 1
+  h.eq("write,fsync,close,chmod,rename", table.concat(events, ","))
+  h.eq(1, #directory_entries(directory))
+end)
+
+h.test("cleans up every atomic-write lifecycle failure", function()
+  local failures = {
+    { operation = "fs_write", message = "write" },
+    { operation = "fs_fsync", message = "fsync" },
+    { operation = "fs_close", message = "close" },
+    { operation = "fs_chmod", message = "chmod" },
+    { operation = "fs_rename", message = "rename" },
+  }
+
+  for _, failure in ipairs(failures) do
+    local directory = h.tempdir()
+    local target = directory .. "/state"
+    h.write(target, "old")
+    local injected = false
+    local real_closes = 0
+    local overrides = {}
+
+    overrides.fs_close = function(...)
+      if failure.operation == "fs_close" and not injected then
+        injected = true
+        return nil, "injected close failure", "EIO"
+      end
+      local closed, err, code = uv.fs_close(...)
+      if closed then
+        real_closes = real_closes + 1
+      end
+      return closed, err, code
+    end
+    if failure.operation ~= "fs_close" then
+      overrides[failure.operation] = function(...)
+        if not injected then
+          injected = true
+          return nil, "injected " .. failure.message .. " failure", "EIO"
+        end
+        return uv[failure.operation](...)
+      end
+    end
+
+    local isolated = fs._new({
+      schedule = function(callback) callback() end,
+      uv = uv_with(overrides),
+    })
+    local calls, callback_error = 0
+    isolated.atomic_write(target, "new bytes", 416, function(err)
+      calls = calls + 1
+      callback_error = err
+    end)
+
+    h.eq(1, calls)
+    h.eq("EIO", callback_error.code)
+    h.matches(failure.message, callback_error.message)
+    h.eq("old", h.read(target))
+    h.eq(1, #directory_entries(directory))
+    h.eq(1, real_closes)
   end
-  h.eq(1, entries)
 end)
 
 h.test("refuses cleanup outside the recorded temp parent", function()
@@ -177,4 +307,54 @@ h.test("removes a guarded tree without following external symlinks", function()
   h.eq(nil, err)
   h.eq(nil, uv.fs_lstat(target))
   h.eq("outside", h.read(outside .. "/keep"))
+end)
+
+h.test("refuses cleanup through a symlinked parent", function()
+  local recorded_root = h.tempdir()
+  local outside = h.tempdir()
+  local parent = recorded_root .. "/parent"
+  local target = parent .. "/aichatter-session"
+  h.symlink(outside, parent)
+  h.mkdir(outside .. "/aichatter-session")
+  h.write(outside .. "/aichatter-session/keep", "outside")
+
+  local err = wait_for_callback(function(cb)
+    fs.remove_tree_guarded(target, parent, cb)
+  end)
+
+  h.truthy(err)
+  h.matches("symlink ancestor", err.message)
+  h.eq("outside", h.read(outside .. "/aichatter-session/keep"))
+end)
+
+h.test("revalidates cleanup ancestry immediately before deletion", function()
+  local recorded_root = h.tempdir()
+  local outside = h.tempdir()
+  local parent = recorded_root .. "/parent"
+  local target = parent .. "/aichatter-session"
+  h.mkdir(target)
+  h.write(target .. "/original", "inside")
+  h.mkdir(outside .. "/aichatter-session")
+  h.write(outside .. "/aichatter-session/keep", "outside")
+  local scheduled = {}
+  local isolated = fs._new({
+    schedule = function(callback)
+      scheduled[#scheduled + 1] = callback
+    end,
+  })
+  local calls, callback_error = 0
+
+  isolated.remove_tree_guarded(target, parent, function(err)
+    calls = calls + 1
+    callback_error = err
+  end)
+  h.eq(1, #scheduled)
+  assert(uv.fs_rename(parent, recorded_root .. "/parent-old"))
+  h.symlink(outside, parent)
+  table.remove(scheduled, 1)()
+
+  h.eq(1, calls)
+  h.truthy(callback_error)
+  h.matches("symlink ancestor", callback_error.message)
+  h.eq("outside", h.read(outside .. "/aichatter-session/keep"))
 end)

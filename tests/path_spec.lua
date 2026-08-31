@@ -27,3 +27,16 @@ h.test("uses the normalized start directory outside a git project", function()
   h.mkdir(nested)
   h.eq(path.normalize(nested), path.project_root(nested .. "/."))
 end)
+
+h.test("uses an injected process boundary for project-root fallback", function()
+  local calls = 0
+  local isolated = path._new({
+    system = function()
+      calls = calls + 1
+      error("git unavailable")
+    end,
+  })
+
+  h.eq("/tmp/project", isolated.project_root("/tmp/project/./"))
+  h.eq(1, calls)
+end)

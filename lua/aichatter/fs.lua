@@ -1,7 +1,10 @@
 local path = require("aichatter.path")
 
+local function new(dependencies)
+dependencies = dependencies or {}
 local M = {}
-local uv = vim.uv or vim.loop
+local uv = dependencies.uv or vim.uv or vim.loop
+local schedule = dependencies.schedule or vim.schedule
 local atomic_counter = 0
 
 local function identity(value)
@@ -27,6 +30,54 @@ local function close_fd(fd)
   if fd then
     uv.fs_close(fd)
   end
+end
+
+local function each_ancestor(directory, visitor)
+  local current = "/"
+  for component in directory:gmatch("[^/]+") do
+    current = current == "/" and current .. component or current .. "/" .. component
+    visitor(current)
+  end
+end
+
+local function reject_symlink_ancestors(directory)
+  local missing = false
+  each_ancestor(directory, function(current)
+    if missing then
+      return
+    end
+    local stat, err, code = uv.fs_lstat(current)
+    if not stat then
+      if code == "ENOENT" then
+        missing = true
+        return
+      end
+      check(stat, err, code, "lstat", current)
+    elseif stat.type == "link" then
+      failure("symlink ancestor: " .. current)
+    elseif stat.type ~= "directory" then
+      failure("non-directory ancestor: " .. current)
+    end
+  end)
+end
+
+local function ensure_directory(directory)
+  each_ancestor(directory, function(current)
+    local stat, err, code = uv.fs_lstat(current)
+    if stat then
+      if stat.type == "link" then
+        failure("symlink ancestor: " .. current)
+      elseif stat.type ~= "directory" then
+        failure("non-directory ancestor: " .. current)
+      end
+      return
+    end
+    if code ~= "ENOENT" then
+      check(stat, err, code, "lstat", current)
+    end
+    local made, mkdir_err, mkdir_code = uv.fs_mkdir(current, 493)
+    check(made, mkdir_err, mkdir_code, "mkdir", current)
+  end)
 end
 
 local function copy_file_bytes(source, target, mode)
@@ -145,6 +196,17 @@ function M.copy_tree(source, target, opts, callback)
       return
     end
 
+    if not job.prepared then
+      local prepared, prepare_err = xpcall(function()
+        ensure_directory(vim.fs.dirname(job.queue[1].target))
+      end, identity)
+      if not prepared then
+        finish(type(prepare_err) == "table" and prepare_err or { message = tostring(prepare_err) })
+        return
+      end
+      job.prepared = true
+    end
+
     local processed = 0
     while processed < 128 and job.next_entry <= #job.queue do
       if job.cancel.cancelled then
@@ -173,11 +235,11 @@ function M.copy_tree(source, target, opts, callback)
     elseif job.next_entry > #job.queue then
       finish()
     else
-      vim.schedule(run_batch)
+      schedule(run_batch)
     end
   end
 
-  vim.schedule(run_batch)
+  schedule(run_batch)
 end
 
 local function write_all(fd, target, bytes)
@@ -205,7 +267,7 @@ function M.atomic_write(target, bytes, mode, callback)
     pcall(callback, err)
   end
 
-  vim.schedule(function()
+  schedule(function()
     local temp
     local fd
     local ok, err = xpcall(function()
@@ -228,11 +290,11 @@ function M.atomic_write(target, bytes, mode, callback)
       write_all(fd, temp, bytes)
       local synced, sync_err, sync_code = uv.fs_fsync(fd)
       check(synced, sync_err, sync_code, "fsync", temp)
-      local changed, chmod_err, chmod_code = uv.fs_chmod(temp, permissions(mode))
-      check(changed, chmod_err, chmod_code, "chmod", temp)
       local closed, close_err, close_code = uv.fs_close(fd)
       check(closed, close_err, close_code, "close", temp)
       fd = nil
+      local changed, chmod_err, chmod_code = uv.fs_chmod(temp, permissions(mode))
+      check(changed, chmod_err, chmod_code, "chmod", temp)
       local renamed, rename_err, rename_code = uv.fs_rename(temp, target)
       check(renamed, rename_err, rename_code, "rename", target)
       temp = nil
@@ -296,8 +358,18 @@ function M.remove_tree_guarded(target, expected_parent, callback)
     return
   end
 
-  vim.schedule(function()
+  local ancestors_ok, ancestor_err = xpcall(function()
+    reject_symlink_ancestors(vim.fs.dirname(target))
+  end, identity)
+  if not ancestors_ok then
+    pcall(callback, type(ancestor_err) == "table" and ancestor_err
+      or { message = tostring(ancestor_err) })
+    return
+  end
+
+  schedule(function()
     local ok, err = xpcall(function()
+      reject_symlink_ancestors(vim.fs.dirname(target))
       remove_entry(target)
     end, identity)
     local callback_error
@@ -308,4 +380,9 @@ function M.remove_tree_guarded(target, expected_parent, callback)
   end)
 end
 
+return M
+end
+
+local M = new()
+M._new = new
 return M
