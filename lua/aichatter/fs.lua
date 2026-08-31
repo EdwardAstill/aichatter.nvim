@@ -379,8 +379,12 @@ local function write_all(fd, target, bytes)
   end
 end
 
-function M.atomic_write(target, bytes, mode, callback)
+function M.atomic_write(target, bytes, mode, opts, callback)
+  if type(opts) == "function" or opts == nil then
+    callback, opts = opts, {}
+  end
   callback = callback or function() end
+  opts = opts or {}
   target = path.normalize(target)
   local called = false
 
@@ -407,6 +411,12 @@ function M.atomic_write(target, bytes, mode, callback)
       fd = nil
       local changed, chmod_err, chmod_code = uv.fs_chmod(temp, permissions(mode))
       check(changed, chmod_err, chmod_code, "chmod", temp)
+      if opts.before_commit then
+        local guard_err = opts.before_commit()
+        if guard_err then
+          error(guard_err, 0)
+        end
+      end
       local renamed, rename_err, rename_code = uv.fs_rename(temp, target)
       check(renamed, rename_err, rename_code, "rename", target)
       temp = nil

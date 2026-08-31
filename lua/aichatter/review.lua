@@ -3,7 +3,7 @@ local default_fs = require("aichatter.fs")
 local default_manifest = require("aichatter.manifest")
 
 local function once(callback)
-  callback = callback or function() end
+  assert(type(callback) == "function", "callback function is required")
   local called = false
   return function(...)
     if called then
@@ -100,16 +100,6 @@ local function same_change(left, right)
     and left.candidate_endofline == right.candidate_endofline
 end
 
-local function read_file(root, relative)
-  local file, err = io.open(root .. "/" .. relative, "rb")
-  if not file then
-    return nil, err
-  end
-  local bytes = file:read("*a")
-  file:close()
-  return bytes
-end
-
 local function entry_mode(entry)
   return entry and entry.kind == "file" and entry.mode or nil
 end
@@ -132,6 +122,76 @@ local function new(dependencies)
   local uv = dependencies.uv or vim.uv or vim.loop
   local Review = {}
   Review.__index = Review
+
+  local function failure(code, message)
+    return { code = code, message = message }
+  end
+
+  local function open_flags()
+    local constants = uv.constants or {}
+    if type(constants.O_RDONLY) == "number" and type(constants.O_NOFOLLOW) == "number" then
+      return bit.bor(constants.O_RDONLY, constants.O_NOFOLLOW)
+    end
+    return "r"
+  end
+
+  local function same_identity(left, right)
+    return left and right and left.dev ~= nil and left.ino ~= nil
+      and left.dev == right.dev and left.ino == right.ino
+  end
+
+  local function verified_read(root, relative, entry)
+    if not entry or entry.kind ~= "file" then
+      return nil
+    end
+    local target = root .. "/" .. relative
+    local before, before_err, before_code = uv.fs_lstat(target)
+    if not before then
+      if before_code == "ENOENT" then
+        error(failure("changed", "snapshot file disappeared: " .. target), 0)
+      end
+      error(failure(before_code, before_err or "could not stat " .. target), 0)
+    end
+    local before_mode = bit.band(before.mode, 511)
+    if before.type ~= "file" or before.size ~= entry.size or before_mode ~= entry.mode then
+      error(failure("changed", "snapshot identity changed: " .. target), 0)
+    end
+    local fd, open_err, open_code = uv.fs_open(target, open_flags(), 0)
+    if not fd then
+      error(failure(open_code, open_err or "could not open " .. target), 0)
+    end
+    local chunks = {}
+    local ok, result = xpcall(function()
+      local opened, stat_err, stat_code = uv.fs_fstat(fd)
+      if not opened then error(failure(stat_code, stat_err or "could not stat " .. target), 0) end
+      if not same_identity(before, opened) or opened.size ~= entry.size
+        or bit.band(opened.mode, 511) ~= entry.mode then
+        error(failure("changed", "snapshot file changed while opening: " .. target), 0)
+      end
+      local offset = 0
+      while offset < opened.size do
+        local bytes, read_err, read_code = uv.fs_read(fd, math.min(65536, opened.size - offset), offset)
+        if bytes == nil then error(failure(read_code, read_err or "could not read " .. target), 0) end
+        if bytes == "" then break end
+        chunks[#chunks + 1] = bytes
+        offset = offset + #bytes
+      end
+      return table.concat(chunks)
+    end, function(err) return err end)
+    local closed, close_err, close_code = uv.fs_close(fd)
+    if not ok then error(result, 0) end
+    if not closed then error(failure(close_code, close_err or "could not close " .. target), 0) end
+    local after, after_err, after_code = uv.fs_lstat(target)
+    if not after then
+      error(failure(after_code == "ENOENT" and "changed" or after_code,
+        after_err or "snapshot file disappeared: " .. target), 0)
+    end
+    if not same_identity(before, after) or after.size ~= entry.size
+      or bit.band(after.mode, 511) ~= entry.mode or vim.fn.sha256(result) ~= entry.digest then
+      error(failure("changed", "snapshot bytes changed: " .. target), 0)
+    end
+    return result
+  end
 
   local function write_shadow(root, relative, bytes, mode, callback)
     callback = once(callback)
@@ -166,25 +226,55 @@ local function new(dependencies)
     end)
   end
 
-  local function run_operations(operations, callback)
+  local function shadow_operation(root, relative, next_exists, next_bytes, next_mode,
+      previous_exists, previous_bytes, previous_mode)
+    return {
+      apply = function(done)
+        write_shadow(root, relative, next_exists and next_bytes or nil, next_mode, done)
+      end,
+      rollback = function(done)
+        write_shadow(root, relative, previous_exists and previous_bytes or nil, previous_mode, done)
+      end,
+    }
+  end
+
+  local function run_transaction(operations, callback)
     callback = once(callback)
+    local applied = {}
     local index = 1
-    local advance
-    advance = function(err)
-      if err then
-        callback(err)
-        return
+    local function rollback(original_err)
+      local rollback_index = #applied
+      local function restore(rollback_err)
+        if rollback_err then
+          callback({
+            code = "rollback_failed",
+            message = "mutation failed and rollback was incomplete",
+            cause = original_err,
+            rollback = rollback_err,
+          })
+          return
+        end
+        local operation = applied[rollback_index]
+        rollback_index = rollback_index - 1
+        if not operation then
+          callback(original_err)
+          return
+        end
+        local ok, thrown = pcall(operation.rollback, restore)
+        if not ok then restore(error_value(thrown)) end
       end
+      restore()
+    end
+    local function advance(err)
+      if err then rollback(err); return end
       local operation = operations[index]
       index = index + 1
-      if not operation then
-        callback()
-        return
-      end
-      local ok, thrown = pcall(operation, advance)
-      if not ok then
-        callback(error_value(thrown))
-      end
+      if not operation then callback(); return end
+      local ok, thrown = pcall(operation.apply, function(apply_err)
+        if not apply_err then applied[#applied + 1] = operation end
+        advance(apply_err)
+      end)
+      if not ok then advance(error_value(thrown)) end
     end
     advance()
   end
@@ -205,6 +295,29 @@ local function new(dependencies)
 
   function Review:files()
     return self._files
+  end
+
+  local function refresh_after_failure(self, original_err, callback)
+    self:refresh(function(refresh_err)
+      if refresh_err then
+        callback({
+          code = "recovery_refresh_failed",
+          message = "mutation failed and review refresh also failed",
+          cause = original_err,
+          refresh = refresh_err,
+        })
+      else
+        callback(original_err)
+      end
+    end)
+  end
+
+  local function restore_live(self, relative, before, after, callback)
+    if before.exists then
+      self.live:write(relative, before.bytes, before.mode or 420, after, callback)
+    else
+      self.live:delete(relative, after, callback)
+    end
   end
 
   local function file_status(record)
@@ -267,8 +380,8 @@ local function new(dependencies)
       local before, after = change.before, change.after
       local base_exists = before ~= nil
       local candidate_exists = after ~= nil
-      local base = before and before.kind == "file" and read_file(self.baseline_root, relative) or nil
-      local candidate = after and after.kind == "file" and read_file(self.workspace_root, relative) or nil
+      local base = verified_read(self.baseline_root, relative, before)
+      local candidate = verified_read(self.workspace_root, relative, after)
       local regular = (not before or before.kind == "file")
         and (not after or after.kind == "file")
       local binary = not regular
@@ -346,8 +459,11 @@ local function new(dependencies)
     callback = once(callback)
     local base_entries, workspace_entries
     local remaining = 2
+    local failed = false
     local function completed(err)
+      if failed then return end
       if err then
+        failed = true
         callback(err)
         return
       end
@@ -465,9 +581,10 @@ local function new(dependencies)
     return live_hunk.base_start + offset
   end
 
-  local function apply_hunks(bytes, hunks, coordinate, baseline_count)
+  local function apply_hunks(bytes, hunks, coordinate)
     local parsed = diff.lines(bytes)
     local endofline = parsed.endofline
+    local target_count = #parsed.lines
     local ordered = {}
     for _, hunk in ipairs(hunks) do
       ordered[#ordered + 1] = hunk
@@ -475,11 +592,10 @@ local function new(dependencies)
     table.sort(ordered, function(left, right)
       return coordinate(left) > coordinate(right)
     end)
-    baseline_count = baseline_count or #parsed.lines
     for _, hunk in ipairs(ordered) do
       local start, count, replacement = coordinate(hunk)
       parsed.lines = replace_lines(parsed.lines, start, count, replacement)
-      if hunk.base_start + hunk.base_count == baseline_count
+      if start + count == target_count
         and hunk.base_endofline ~= hunk.candidate_endofline then
         endofline = hunk.candidate_endofline
       end
@@ -487,48 +603,131 @@ local function new(dependencies)
     return lines_bytes(parsed.lines, endofline)
   end
 
-  function Review:_reconcile_after_accept(record, live_hunks, callback)
+  local function overlaps_candidate(user_hunk, accepted_hunk)
+    local left_start = user_hunk.base_start
+    local left_count = user_hunk.base_count
+    local right_start = accepted_hunk.candidate_start
+    local right_count = accepted_hunk.candidate_count
+    local left_end = left_start + left_count
+    local right_end = right_start + right_count
+    if left_count == 0 and right_count == 0 then return left_start == right_start end
+    if left_count == 0 then return left_start >= right_start and left_start <= right_end end
+    if right_count == 0 then return right_start >= left_start and right_start <= left_end end
+    return left_start < right_end and right_start < left_end
+  end
+
+  function Review:_reconcile_after_accept(record, _, callback)
+    local live_snapshot, snapshot_err = self.live:snapshot(record.path)
+    if not live_snapshot then callback(snapshot_err); return end
+    local accepted = {}
+    for _, hunk in ipairs(record.hunks) do
+      if hunk.status == "accepted" then accepted[#accepted + 1] = hunk end
+    end
+    local baseline_count = #diff.lines(record.base).lines
+    local accepted_bytes = apply_hunks(record.base, accepted, function(hunk)
+      return hunk.base_start, hunk.base_count, hunk.candidate_lines
+    end, baseline_count)
+    local accepted_changes = diff.hunks(record.base, accepted_bytes)
+    local user_hunks = diff.hunks(accepted_bytes, live_snapshot.bytes or "")
+    local outstanding = diff.hunks(accepted_bytes, record.candidate)
+    if accepted_changes.binary or user_hunks.binary or outstanding.binary then
+      callback({ code = "conflict", message = "live file became binary during reconciliation" })
+      return
+    end
+
+    local accepted_override = false
+    for _, user_hunk in ipairs(user_hunks) do
+      for _, accepted_hunk in ipairs(accepted_changes) do
+        if overlaps_candidate(user_hunk, accepted_hunk) then accepted_override = true end
+      end
+    end
+
     local safe = {}
+    local baseline_coordinates = {}
     local workspace_coordinates = {}
-    for _, live_hunk in ipairs(live_hunks) do
-      local accepted_match
-      local overlapping_pending
-      local overlapping_accepted
-      for _, proposal in ipairs(record.hunks) do
-        if proposal.status == "accepted" and same_change(live_hunk, proposal) then
-          accepted_match = proposal
-          break
-        elseif overlaps(live_hunk, proposal) then
-          if proposal.status == "pending" or proposal.status == "conflict" then
-            overlapping_pending = proposal
-          elseif proposal.status == "accepted"
-            and live_hunk.base_start == proposal.base_start
-            and live_hunk.base_count == proposal.base_count then
-            overlapping_accepted = proposal
+    if accepted_override then
+      local live_hunks = diff.hunks(record.base, live_snapshot.bytes or "")
+      if live_hunks.binary then
+        callback({ code = "conflict", message = "live file became binary during reconciliation" })
+        return
+      end
+      for _, live_hunk in ipairs(live_hunks) do
+        local accepted_match
+        local overlapping_pending
+        local overlapping_accepted
+        for _, proposal in ipairs(record.hunks) do
+          if proposal.status == "accepted" and same_change(live_hunk, proposal) then
+            accepted_match = proposal
+            break
+          elseif overlaps(live_hunk, proposal) then
+            if proposal.status == "pending" or proposal.status == "conflict" then
+              overlapping_pending = proposal
+            elseif proposal.status == "accepted"
+              and live_hunk.base_start == proposal.base_start
+              and live_hunk.base_count == proposal.base_count then
+              overlapping_accepted = proposal
+            end
+          end
+        end
+        if overlapping_pending then
+          mark_conflict(record, overlapping_pending)
+        elseif not accepted_match then
+          safe[#safe + 1] = live_hunk
+          baseline_coordinates[live_hunk] = {
+            live_hunk.base_start, live_hunk.base_count, live_hunk.candidate_lines,
+          }
+          if overlapping_accepted then
+            workspace_coordinates[live_hunk] = {
+              overlapping_accepted.candidate_start,
+              overlapping_accepted.candidate_count,
+              live_hunk.candidate_lines,
+            }
+          else
+            workspace_coordinates[live_hunk] = {
+              proposal_start(live_hunk, record.hunks),
+              live_hunk.base_count,
+              live_hunk.candidate_lines,
+            }
           end
         end
       end
-      if overlapping_pending then
-        mark_conflict(record, overlapping_pending)
-      elseif not accepted_match then
-        safe[#safe + 1] = live_hunk
-        if overlapping_accepted then
-          workspace_coordinates[live_hunk] = {
-            overlapping_accepted.candidate_start,
-            overlapping_accepted.candidate_count,
-            live_hunk.candidate_lines,
-          }
+    else
+      for _, user_hunk in ipairs(user_hunks) do
+        local pending_overlap = false
+        for _, proposal in ipairs(outstanding) do
+          if overlaps(user_hunk, proposal) then pending_overlap = true end
+        end
+        if pending_overlap then
+          for _, proposal in ipairs(record.hunks) do
+            if proposal.status == "pending" or proposal.status == "conflict" then
+              mark_conflict(record, proposal)
+            end
+          end
         else
-          workspace_coordinates[live_hunk] = {
-            proposal_start(live_hunk, record.hunks),
-            live_hunk.base_count,
-            live_hunk.candidate_lines,
+          local inverse_offset = 0
+          for _, accepted_hunk in ipairs(accepted_changes) do
+            if accepted_hunk.candidate_start + accepted_hunk.candidate_count
+              <= user_hunk.base_start then
+              inverse_offset = inverse_offset
+                + accepted_hunk.base_count - accepted_hunk.candidate_count
+            end
+          end
+          safe[#safe + 1] = user_hunk
+          baseline_coordinates[user_hunk] = {
+            user_hunk.base_start + inverse_offset,
+            user_hunk.base_count,
+            user_hunk.candidate_lines,
+          }
+          workspace_coordinates[user_hunk] = {
+            proposal_start(user_hunk, outstanding),
+            user_hunk.base_count,
+            user_hunk.candidate_lines,
           }
         end
       end
     end
 
-    local live_mode = self.live:mode(record.path) or record.base_mode or record.candidate_mode or 420
+    local live_mode = live_snapshot.mode or record.base_mode or record.candidate_mode or 420
     local mode_conflict = record.mode_changed and live_mode ~= record.base_mode
     if mode_conflict then
       record.mode_status = "conflict"
@@ -540,22 +739,23 @@ local function new(dependencies)
       callback()
       return
     end
-    local baseline_count = #diff.lines(record.base).lines
     local new_base = apply_hunks(record.base, safe, function(hunk)
-      return hunk.base_start, hunk.base_count, hunk.candidate_lines
+      return unpack(baseline_coordinates[hunk])
     end, baseline_count)
     local new_workspace = apply_hunks(record.candidate, safe, function(hunk)
       return unpack(workspace_coordinates[hunk])
-    end, baseline_count)
-    run_operations({
-      function(done)
-        local mode = record.mode_changed and record.base_mode or live_mode
-        write_shadow(self.baseline_root, record.path, new_base, mode, done)
-      end,
-      function(done)
-        local mode = record.mode_changed and record.candidate_mode or live_mode
-        write_shadow(self.workspace_root, record.path, new_workspace, mode, done)
-      end,
+    end, #diff.lines(accepted_bytes).lines)
+    local base_mode = record.mode_changed and record.base_mode or live_mode
+    local workspace_mode = record.mode_changed and record.candidate_mode or live_mode
+    run_transaction({
+      shadow_operation(
+        self.baseline_root, record.path, true, new_base, base_mode,
+        record.base_exists, record.base, record.base_mode or 420
+      ),
+      shadow_operation(
+        self.workspace_root, record.path, true, new_workspace, workspace_mode,
+        record.candidate_exists, record.candidate, record.candidate_mode or 420
+      ),
     }, callback)
   end
 
@@ -573,33 +773,36 @@ local function new(dependencies)
     if hunk.status == "accepted" or hunk.status == "rejected" then
       callback()
       return
-    elseif hunk.status == "conflict" then
-      callback({ code = "conflict", message = "hunk is conflicted" })
+    end
+    local before, snapshot_err = self.live:snapshot(relative)
+    if not before then
+      callback(snapshot_err)
       return
     end
-    local live_bytes, read_err = self.live:read(relative)
-    if read_err then
-      callback(read_err)
-      return
-    end
-    local analysis, conflict_err = applies_at_baseline(record, hunk, live_bytes, live_bytes ~= nil)
+    local analysis, conflict_err = applies_at_baseline(record, hunk, before.bytes, before.exists)
     if not analysis then
       mark_conflict(record, hunk)
       callback(conflict_err)
       return
     end
     local accepted_bytes = apply_live_hunk(record, hunk, analysis)
-    local live_mode = self.live:mode(relative) or record.candidate_mode or record.base_mode or 420
-    self.live:write(relative, accepted_bytes, live_mode, function(write_err)
+    local live_mode = before.mode or record.candidate_mode or record.base_mode or 420
+    self.live:write(relative, accepted_bytes, live_mode, before, function(write_err)
       if write_err then
         callback(write_err)
         return
       end
+      local after, after_err = self.live:snapshot(relative)
+      if not after then callback(after_err); return end
       hunk.status = "accepted"
       record.status = file_status(record)
       self:_reconcile_after_accept(record, analysis.hunks, function(reconcile_err)
         if reconcile_err then
-          callback(reconcile_err)
+          hunk.status = "pending"
+          record.status = file_status(record)
+          restore_live(self, relative, before, after, function(restore_err)
+            refresh_after_failure(self, restore_err or reconcile_err, callback)
+          end)
           return
         end
         self:refresh(callback)
@@ -673,28 +876,13 @@ local function new(dependencies)
     )
   end
 
-  function Review:_file_conflict(record)
-    local live_bytes, read_err = self.live:read(record.path)
-    if read_err then
-      return read_err
-    end
-    if (live_bytes ~= nil) ~= record.base_exists or (live_bytes or "") ~= record.base then
-      return { code = "conflict", message = "live file changed" }
-    end
-    local live_mode, mode_err = self.live:mode(record.path)
-    if mode_err then
-      return mode_err
-    end
-    if record.base_exists and live_mode ~= record.base_mode then
-      return { code = "conflict", message = "live file mode changed" }
-    end
-  end
-
   function Review:_accept_whole_file(record, callback)
-    local conflict_err = self:_file_conflict(record)
-    if conflict_err then
+    local before, snapshot_err = self.live:snapshot(record.path)
+    if not before then callback(snapshot_err); return end
+    if before.exists ~= record.base_exists or (before.bytes or "") ~= record.base
+      or (record.base_exists and before.mode ~= record.base_mode) then
       mark_conflict(record)
-      callback(conflict_err)
+      callback({ code = "conflict", message = "live file changed" })
       return
     end
     local function advance_baseline(live_err)
@@ -702,6 +890,8 @@ local function new(dependencies)
         callback(live_err)
         return
       end
+      local after, after_err = self.live:snapshot(record.path)
+      if not after then callback(after_err); return end
       write_shadow(
         self.baseline_root,
         record.path,
@@ -709,7 +899,9 @@ local function new(dependencies)
         record.candidate_mode or record.base_mode or 420,
         function(baseline_err)
           if baseline_err then
-            callback(baseline_err)
+            restore_live(self, record.path, before, after, function(restore_err)
+              refresh_after_failure(self, restore_err or baseline_err, callback)
+            end)
           else
             self:refresh(callback)
           end
@@ -721,36 +913,38 @@ local function new(dependencies)
         record.path,
         record.candidate,
         record.candidate_mode or record.base_mode or 420,
+        before,
         advance_baseline
       )
     else
-      self.live:delete(record.path, advance_baseline)
+      self.live:delete(record.path, before, advance_baseline)
     end
   end
 
   function Review:_accept_mode(record, callback)
     callback = once(callback)
-    local live_bytes, read_err = self.live:read(record.path)
-    if read_err then
-      callback(read_err)
-      return
+    local before, snapshot_err = self.live:snapshot(record.path)
+    if not before then callback(snapshot_err); return end
+    local accepted = {}
+    for _, hunk in ipairs(record.hunks) do
+      if hunk.status == "accepted" then accepted[#accepted + 1] = hunk end
     end
-    local live_mode, mode_err = self.live:mode(record.path)
-    if mode_err then
-      callback(mode_err)
-      return
-    end
-    if live_bytes == nil or live_mode ~= record.base_mode then
+    local accepted_bytes = apply_hunks(record.base, accepted, function(hunk)
+      return hunk.base_start, hunk.base_count, hunk.candidate_lines
+    end, #diff.lines(record.base).lines)
+    if not before.exists or before.mode ~= record.base_mode or before.bytes ~= accepted_bytes then
       record.mode_status = "conflict"
       record.status = "conflict"
       callback({ code = "conflict", message = "live file mode changed" })
       return
     end
-    self.live:write(record.path, live_bytes, record.candidate_mode, function(live_err)
+    self.live:write(record.path, before.bytes, record.candidate_mode, before, function(live_err)
       if live_err then
         callback(live_err)
         return
       end
+      local after, after_err = self.live:snapshot(record.path)
+      if not after then callback(after_err); return end
       write_shadow(
         self.baseline_root,
         record.path,
@@ -758,7 +952,10 @@ local function new(dependencies)
         record.candidate_mode,
         function(baseline_err)
           if baseline_err then
-            callback(baseline_err)
+            record.mode_status = "pending"
+            restore_live(self, record.path, before, after, function(restore_err)
+              refresh_after_failure(self, restore_err or baseline_err, callback)
+            end)
           else
             self:refresh(callback)
           end
@@ -873,69 +1070,54 @@ local function new(dependencies)
   end
 
   function Review:_sync_record(record, live_bytes, live_exists, live_mode)
-    local pending = {}
-    for _, hunk in ipairs(record.hunks) do
-      if hunk.status == "pending" or hunk.status == "conflict" then
-        pending[#pending + 1] = hunk
+    if record.file_level then
+      if (live_bytes or "") ~= record.base or live_exists ~= record.base_exists
+        or live_mode ~= record.base_mode then
+        return nil, true
       end
+      return nil
     end
-    if record.file_level and ((live_bytes or "") ~= record.base
-      or live_exists ~= record.base_exists or live_mode ~= record.base_mode) then
-      return nil, true
-    end
-    if record.mode_changed and live_mode ~= record.base_mode then
-      return nil, true
-    end
-    local live_hunks = diff.hunks(record.base, live_bytes or "")
-    if live_hunks.binary then
-      return nil, #pending > 0
-    end
-    for _, live_hunk in ipairs(live_hunks) do
-      for _, proposal in ipairs(pending) do
-        if overlaps(live_hunk, proposal) then
-          return nil, true
-        end
-      end
-    end
-    if live_exists ~= record.base_exists and #live_hunks == 0 and #pending > 0 then
-      return nil, true
-    end
+    if record.mode_changed and live_mode ~= record.base_mode then return nil, true end
 
-    local workspace_coordinates = {}
-    for _, live_hunk in ipairs(live_hunks) do
-      local matched
-      for _, proposal in ipairs(record.hunks) do
-        if overlaps(live_hunk, proposal)
-          and live_hunk.base_start == proposal.base_start
-          and live_hunk.base_count == proposal.base_count then
-          matched = proposal
-          break
-        end
-      end
-      if matched then
-        workspace_coordinates[live_hunk] = {
-          matched.candidate_start,
-          matched.candidate_count,
-          live_hunk.candidate_lines,
-        }
-      else
-        workspace_coordinates[live_hunk] = {
-          proposal_start(live_hunk, record.hunks),
-          live_hunk.base_count,
-          live_hunk.candidate_lines,
-        }
+    local accepted = {}
+    local accepted_exists = record.base_exists
+    for _, hunk in ipairs(record.hunks) do
+      if hunk.status == "accepted" then
+        accepted[#accepted + 1] = hunk
+        if hunk.file_creation then accepted_exists = true end
       end
     end
     local baseline_count = #diff.lines(record.base).lines
-    local new_base = apply_hunks(record.base, live_hunks, function(hunk)
+    local accepted_bytes = apply_hunks(record.base, accepted, function(hunk)
       return hunk.base_start, hunk.base_count, hunk.candidate_lines
     end, baseline_count)
-    local new_workspace = apply_hunks(record.candidate, live_hunks, function(hunk)
+    local outstanding = diff.hunks(accepted_bytes, record.candidate)
+    if outstanding.binary then return nil, true end
+    local user_hunks = diff.hunks(accepted_bytes, live_bytes or "")
+    if user_hunks.binary then return nil, true end
+    for _, user_hunk in ipairs(user_hunks) do
+      for _, proposal in ipairs(outstanding) do
+        if overlaps(user_hunk, proposal) then return nil, true end
+      end
+    end
+    if live_exists ~= accepted_exists and #outstanding > 0 then return nil, true end
+
+    local workspace_coordinates = {}
+    for _, user_hunk in ipairs(user_hunks) do
+      workspace_coordinates[user_hunk] = {
+        proposal_start(user_hunk, outstanding),
+        user_hunk.base_count,
+        user_hunk.candidate_lines,
+      }
+    end
+    local new_workspace = apply_hunks(record.candidate, user_hunks, function(hunk)
       return unpack(workspace_coordinates[hunk])
-    end, baseline_count)
+    end, #diff.lines(accepted_bytes).lines)
+    local workspace_exists = record.candidate_exists
+    if live_exists ~= accepted_exists and #outstanding == 0 then workspace_exists = live_exists end
     return {
-      base = live_exists and new_base or nil,
-      workspace = live_exists and new_workspace or nil,
+      base = live_exists and (live_bytes or "") or nil,
+      workspace = workspace_exists and new_workspace or nil,
       base_mode = record.mode_changed and record.base_mode
         or live_mode or record.base_mode or record.candidate_mode or 420,
       workspace_mode = record.mode_changed and record.candidate_mode
@@ -961,17 +1143,14 @@ local function new(dependencies)
       local conflicts = {}
       for _, relative in ipairs(sorted_keys(paths)) do
         local base_entry = self._baseline_entries[relative]
-        local live_bytes, read_err = self.live:read(relative)
-        if read_err then
-          callback(read_err)
+        local live_snapshot, snapshot_err = self.live:snapshot(relative)
+        if not live_snapshot then
+          callback(snapshot_err)
           return
         end
-        local live_exists = live_bytes ~= nil
-        local live_mode, mode_err = self.live:mode(relative)
-        if mode_err then
-          callback(mode_err)
-          return
-        end
+        local live_exists = live_snapshot.exists
+        local live_bytes = live_exists and live_snapshot.bytes or nil
+        local live_mode = live_snapshot.mode
         local record = self._by_path[relative]
         if record then
           local synced, conflict = self:_sync_record(record, live_bytes, live_exists, live_mode)
@@ -979,38 +1158,55 @@ local function new(dependencies)
             conflicts[#conflicts + 1] = relative
           elseif synced and ((live_bytes or "") ~= record.base
             or live_exists ~= record.base_exists or live_mode ~= record.base_mode) then
-            operations[#operations + 1] = function(done)
-              write_shadow(self.baseline_root, relative, synced.base, synced.base_mode, done)
-            end
-            operations[#operations + 1] = function(done)
-              write_shadow(
-                self.workspace_root,
-                relative,
-                synced.workspace,
-                synced.workspace_mode,
-                done
-              )
-            end
+            operations[#operations + 1] = shadow_operation(
+              self.baseline_root, relative, synced.base ~= nil, synced.base, synced.base_mode,
+              record.base_exists, record.base, record.base_mode or 420
+            )
+            operations[#operations + 1] = shadow_operation(
+              self.workspace_root, relative, synced.workspace ~= nil,
+              synced.workspace, synced.workspace_mode,
+              record.candidate_exists, record.candidate, record.candidate_mode or 420
+            )
           end
         else
-          local base_bytes = base_entry and base_entry.kind == "file"
-            and read_file(self.baseline_root, relative) or nil
+          local read_ok, base_bytes = pcall(verified_read, self.baseline_root, relative, base_entry)
+          if not read_ok then callback(error_value(base_bytes)); return end
           local base_mode = entry_mode(base_entry)
+          local workspace_entry = self._workspace_entries[relative]
+          local workspace_ok, workspace_bytes = pcall(
+            verified_read, self.workspace_root, relative, workspace_entry
+          )
+          if not workspace_ok then callback(error_value(workspace_bytes)); return end
+          local workspace_mode = entry_mode(workspace_entry)
           if base_bytes ~= live_bytes or (base_entry ~= nil) ~= live_exists
             or (live_exists and base_mode ~= live_mode) then
-            operations[#operations + 1] = function(done)
-              write_shadow(self.baseline_root, relative, live_bytes, live_mode or 420, done)
-            end
-            operations[#operations + 1] = function(done)
-              write_shadow(self.workspace_root, relative, live_bytes, live_mode or 420, done)
-            end
+            operations[#operations + 1] = shadow_operation(
+              self.baseline_root, relative, live_exists, live_bytes, live_mode or 420,
+              base_entry ~= nil, base_bytes, base_mode or 420
+            )
+            operations[#operations + 1] = shadow_operation(
+              self.workspace_root, relative, live_exists, live_bytes, live_mode or 420,
+              workspace_entry ~= nil, workspace_bytes, workspace_mode or 420
+            )
           end
         end
       end
-      run_operations(operations, function(operation_err)
+      run_transaction(operations, function(operation_err)
         if operation_err then
-          callback(operation_err)
+          refresh_after_failure(self, operation_err, callback)
           return
+        end
+        local conflicted = {}
+        for _, relative in ipairs(conflicts) do conflicted[relative] = true end
+        for relative, record in pairs(self._by_path) do
+          if not conflicted[relative] then
+            for _, hunk in ipairs(record.hunks) do
+              if hunk.status == "conflict" then hunk.status = "pending" end
+            end
+            if record.mode_status == "conflict" then record.mode_status = "pending" end
+            if record.file_level and record.status == "conflict" then record.status = "pending" end
+            record.status = file_status(record)
+          end
         end
         self:refresh(function(refresh_err)
           if refresh_err then

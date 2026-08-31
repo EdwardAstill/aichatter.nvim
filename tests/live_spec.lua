@@ -7,6 +7,16 @@ local function wait_call(invoke)
   return err
 end
 
+local function disk_snapshot(path)
+  local stat = assert(vim.uv.fs_lstat(path))
+  return {
+    exists = true,
+    bytes = h.read(path),
+    mode = bit.band(stat.mode, 511),
+    identity = { dev = stat.dev, ino = stat.ino },
+  }
+end
+
 h.test("reads loaded unsaved buffer bytes before disk bytes", function()
   local root = h.tempdir()
   h.write(root .. "/main.lua", "disk\n")
@@ -127,4 +137,212 @@ h.test("applies an accepted mode change for a loaded file without saving content
   h.eq(493, h.mode(root .. "/script"))
   h.eq("disk\n", h.read(root .. "/script"))
   h.eq("accepted\n", live:read("script"))
+end)
+
+h.test("guarded unloaded write rejects a file changed after validation", function()
+  local root = h.tempdir()
+  h.write(root .. "/main.txt", "baseline\n")
+  local live = Live.new(root)
+  local expected = disk_snapshot(root .. "/main.txt")
+  local calls, captured = 0
+
+  live:write("main.txt", "candidate\n", 420, expected, function(err)
+    calls, captured = calls + 1, err
+  end)
+  h.write(root .. "/main.txt", "user\n")
+  assert(h.wait_for(function() return calls > 0 end, 3000))
+
+  h.eq(1, calls)
+  h.eq("conflict", captured.code)
+  h.eq("user\n", h.read(root .. "/main.txt"))
+end)
+
+h.test("guarded delete rejects a file changed after validation", function()
+  local root = h.tempdir()
+  h.write(root .. "/main.txt", "baseline\n")
+  local live = Live.new(root)
+  local expected = disk_snapshot(root .. "/main.txt")
+  local calls, captured = 0
+
+  live:delete("main.txt", expected, function(err)
+    calls, captured = calls + 1, err
+  end)
+  h.write(root .. "/main.txt", "user\n")
+  assert(h.wait_for(function() return calls > 0 end, 3000))
+
+  h.eq(1, calls)
+  h.eq("conflict", captured.code)
+  h.eq("user\n", h.read(root .. "/main.txt"))
+end)
+
+h.test("guarded loaded delete preserves a disk edit behind the buffer", function()
+  local root = h.tempdir()
+  h.write(root .. "/main.txt", "baseline\n")
+  local bufnr = h.load_buffer(root .. "/main.txt", { "baseline" }, false)
+  vim.bo[bufnr].endofline = true
+  local live = Live.new(root)
+  local expected = assert(live:snapshot("main.txt"))
+  local calls, captured = 0
+
+  live:delete("main.txt", expected, function(err)
+    calls, captured = calls + 1, err
+  end)
+  h.write(root .. "/main.txt", "user\n")
+  assert(h.wait_for(function() return calls > 0 end, 3000))
+
+  h.eq(1, calls)
+  h.eq("conflict", captured.code)
+  h.truthy(vim.api.nvim_buf_is_loaded(bufnr))
+  h.eq("user\n", h.read(root .. "/main.txt"))
+end)
+
+h.test("guarded loaded write rejects a changed buffer tick", function()
+  local root = h.tempdir()
+  h.write(root .. "/main.txt", "baseline\n")
+  local bufnr = h.load_buffer(root .. "/main.txt", { "baseline" }, false)
+  vim.bo[bufnr].endofline = true
+  local live = Live.new(root)
+  local expected = disk_snapshot(root .. "/main.txt")
+  expected.bufnr = bufnr
+  expected.changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "user" })
+
+  local captured
+  live:write("main.txt", "candidate\n", 420, expected, function(err)
+    captured = err
+  end)
+
+  h.truthy(captured)
+  h.eq("conflict", captured.code)
+  h.eq("user\n", live:read("main.txt"))
+  h.eq("baseline\n", h.read(root .. "/main.txt"))
+end)
+
+h.test("rejects symlink ancestors without touching outside bytes or mode", function()
+  local root, outside = h.tempdir(), h.tempdir()
+  h.write(outside .. "/file", "outside\n")
+  h.chmod(outside .. "/file", 420)
+  h.symlink(outside, root .. "/linked")
+  local live = Live.new(root)
+
+  local bytes, read_err = live:read("linked/file")
+  local mode, mode_err = live:mode("linked/file")
+  local write_err = wait_call(function(callback)
+    live:write("linked/file", "changed\n", 493, callback)
+  end)
+  local delete_err = wait_call(function(callback)
+    live:delete("linked/file", callback)
+  end)
+
+  h.eq(nil, bytes)
+  h.eq("symlink_ancestor", read_err.code)
+  h.eq(nil, mode)
+  h.eq("symlink_ancestor", mode_err.code)
+  h.eq("symlink_ancestor", write_err.code)
+  h.eq("symlink_ancestor", delete_err.code)
+  h.eq("outside\n", h.read(outside .. "/file"))
+  h.eq(420, h.mode(outside .. "/file"))
+end)
+
+h.test("rejects a root replaced by a symlink after construction", function()
+  local parent, outside = h.tempdir(), h.tempdir()
+  local root = parent .. "/project"
+  h.mkdir(root)
+  h.write(root .. "/file", "inside\n")
+  h.write(outside .. "/file", "outside\n")
+  local live = Live.new(root)
+  assert(vim.uv.fs_rename(root, parent .. "/old-project"))
+  h.symlink(outside, root)
+
+  local bytes, err = live:read("file")
+
+  h.eq(nil, bytes)
+  h.eq("root_changed", err.code)
+  h.eq("outside\n", h.read(outside .. "/file"))
+end)
+
+h.test("scheduled write rejects an ancestor changed into a symlink", function()
+  local root, outside = h.tempdir(), h.tempdir()
+  h.mkdir(root .. "/nested")
+  h.write(root .. "/nested/file", "inside\n")
+  h.write(outside .. "/file", "outside\n")
+  local queued = {}
+  local schedule = function(fn) queued[#queued + 1] = fn end
+  local fs = require("aichatter.fs")._new({ schedule = schedule })
+  local InjectedLive = Live._new({ fs = fs, schedule = schedule })
+  local live = InjectedLive.new(root)
+  local expected = assert(live:snapshot("nested/file"))
+  local calls, captured = 0
+
+  live:write("nested/file", "candidate\n", 420, expected, function(err)
+    calls, captured = calls + 1, err
+  end)
+  assert(vim.uv.fs_rename(root .. "/nested", root .. "/old-nested"))
+  h.symlink(outside, root .. "/nested")
+  h.eq(1, #queued)
+  queued[1]()
+
+  h.eq(1, calls)
+  h.truthy(captured)
+  h.eq("outside\n", h.read(outside .. "/file"))
+  h.eq("inside\n", h.read(root .. "/old-nested/file"))
+end)
+
+h.test("loaded write rolls back mode when the buffer cannot change", function()
+  local root = h.tempdir()
+  h.write(root .. "/script", "baseline\n")
+  h.chmod(root .. "/script", 420)
+  local bufnr = h.load_buffer(root .. "/script", { "baseline" }, false)
+  vim.bo[bufnr].endofline = true
+  vim.bo[bufnr].modifiable = false
+  local live = Live.new(root)
+  local captured
+
+  live:write("script", "candidate\n", 493, function(err) captured = err end)
+
+  h.truthy(captured)
+  h.eq(420, h.mode(root .. "/script"))
+  h.eq("baseline\n", live:read("script"))
+end)
+
+h.test("loaded write rolls back mode after a later descriptor failure", function()
+  local root = h.tempdir()
+  h.write(root .. "/script", "baseline\n")
+  h.chmod(root .. "/script", 420)
+  local bufnr = h.load_buffer(root .. "/script", { "baseline" }, false)
+  vim.bo[bufnr].endofline = true
+  local real_uv = vim.uv
+  local closes = 0
+  local uv = setmetatable({
+    fs_close = function(fd)
+      closes = closes + 1
+      local closed, err, code = real_uv.fs_close(fd)
+      if closes == 3 then return nil, "injected close failure", "ECLOSE" end
+      return closed, err, code
+    end,
+  }, { __index = real_uv })
+  local InjectedLive = Live._new({ uv = uv })
+  local live = InjectedLive.new(root)
+  local captured
+
+  live:write("script", "candidate\n", 493, function(err) captured = err end)
+
+  h.truthy(captured)
+  h.eq("ECLOSE", captured.code)
+  h.eq(420, h.mode(root .. "/script"))
+  h.eq("baseline\n", live:read("script"))
+end)
+
+h.test("requires callbacks for asynchronous live filesystem branches", function()
+  local root = h.tempdir()
+  h.write(root .. "/file", "bytes\n")
+  local live = Live.new(root)
+
+  h.raises("callback", function() live:write("file", "new\n", 420) end)
+  h.raises("callback", function() live:delete("file") end)
+
+  local bufnr = h.load_buffer(root .. "/file", { "bytes" }, true)
+  vim.bo[bufnr].endofline = true
+  live:write("file", "buffer\n", 420)
+  h.eq("buffer\n", live:read("file"))
 end)

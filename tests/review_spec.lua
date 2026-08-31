@@ -22,6 +22,23 @@ local function action(fixture, method, ...)
   end)
 end
 
+local function failing_fs(fail_at)
+  local real = require("aichatter.fs")
+  local calls = 0
+  return setmetatable({
+    atomic_write = function(target, bytes, mode, callback)
+      calls = calls + 1
+      if calls == fail_at then
+        vim.schedule(function()
+          callback({ code = "injected", message = "injected write failure" })
+        end)
+        return
+      end
+      real.atomic_write(target, bytes, mode, callback)
+    end,
+  }, { __index = real })
+end
+
 h.test("refresh exposes proposals without changing live bytes", function()
   local fixture = h.review_fixture("old\n", "new\n")
   local file = fixture.review:files()[1]
@@ -333,4 +350,223 @@ h.test("sync_live discovers a new file that exists only in a loaded buffer", fun
   h.eq("unsaved\n", h.read(fixture.baseline_root .. "/new-buffer.txt"))
   h.eq("unsaved\n", h.read(fixture.workspace_root .. "/new-buffer.txt"))
   h.eq(nil, h.read_optional(fixture.live_root .. "/new-buffer.txt"))
+end)
+
+h.test("accept rejects a disk edit made after conflict validation", function()
+  local fixture = h.review_fixture("old\n", "candidate\n")
+  local calls, captured = 0
+
+  fixture.review:accept_hunk("main.txt", 1, function(err)
+    calls, captured = calls + 1, err
+  end)
+  fixture.set_live("user\n")
+  assert(h.wait_for(function() return calls > 0 end, 3000))
+
+  h.eq(1, calls)
+  h.truthy(captured)
+  h.eq("conflict", captured.code)
+  h.eq("user\n", fixture.live_bytes())
+  h.eq("old\n", fixture.baseline_bytes())
+  h.eq("candidate\n", fixture.workspace_bytes())
+end)
+
+h.test("file deletion rejects a disk edit made after validation", function()
+  local fixture = h.review_fixture("old\n", nil)
+  local calls, captured = 0
+
+  fixture.review:accept_file("main.txt", function(err)
+    calls, captured = calls + 1, err
+  end)
+  fixture.set_live("user\n")
+  assert(h.wait_for(function() return calls > 0 end, 3000))
+
+  h.eq(1, calls)
+  h.truthy(captured)
+  h.eq("conflict", captured.code)
+  h.eq("user\n", fixture.live_bytes())
+  h.eq("old\n", fixture.baseline_bytes())
+end)
+
+h.test("sync applies adjacent user deletion after an accepted insertion once", function()
+  local fixture = h.review_fixture("a\nb\n", "inserted\na\nb\n")
+  h.eq(nil, action(fixture, "accept_hunk", "main.txt", 1))
+  fixture.set_live("inserted\nb\n")
+
+  h.eq(nil, action(fixture, "sync_live"))
+
+  h.eq("inserted\nb\n", fixture.baseline_bytes())
+  h.eq("inserted\nb\n", fixture.workspace_bytes())
+  h.eq({}, fixture.review:files())
+end)
+
+h.test("later accept reconciles a deletion adjacent to an accepted insertion once", function()
+  local fixture = h.review_fixture(
+    "a\nb\nc\nd\n",
+    "inserted\na\nb\nc\nD\n"
+  )
+  local hunks = fixture.review:files()[1].hunks
+  h.eq(nil, action(fixture, "accept_hunk", "main.txt", hunks[1].id))
+  fixture.set_live("inserted\nb\nc\nd\n")
+
+  h.eq(nil, action(fixture, "accept_hunk", "main.txt", hunks[2].id))
+
+  h.eq("inserted\nb\nc\nD\n", fixture.live_bytes())
+  h.eq("b\nc\nd\n", fixture.baseline_bytes())
+  h.eq("inserted\nb\nc\nD\n", fixture.workspace_bytes())
+end)
+
+h.test("reconcile failure rolls back live baseline workspace and decision", function()
+  local fs = failing_fs(2)
+  local fixture = h.review_fixture("a\nb\nc\n", "a\nB\nc\n", {
+    review_dependencies = { fs = fs },
+  })
+  fixture.set_live("a\nb\nC\n")
+
+  local err = action(fixture, "accept_hunk", "main.txt", 1)
+
+  h.eq("injected", err.code)
+  h.eq("a\nb\nC\n", fixture.live_bytes())
+  h.eq("a\nb\nc\n", fixture.baseline_bytes())
+  h.eq("a\nB\nc\n", fixture.workspace_bytes())
+  h.eq("pending", fixture.review:files()[1].hunks[1].status)
+end)
+
+h.test("whole-file baseline failure rolls back accepted binary live bytes", function()
+  local fs = failing_fs(1)
+  local fixture = h.review_fixture("old\0bytes", "new\0bytes", {
+    review_dependencies = { fs = fs },
+  })
+
+  local err = action(fixture, "accept_file", "main.txt")
+
+  h.eq("injected", err.code)
+  h.eq("old\0bytes", fixture.live_bytes())
+  h.eq("old\0bytes", fixture.baseline_bytes())
+  h.eq("new\0bytes", fixture.workspace_bytes())
+  h.eq("pending", fixture.review:files()[1].status)
+end)
+
+h.test("sync workspace failure rolls back the baseline snapshot", function()
+  local fs = failing_fs(2)
+  local fixture = h.review_fixture("a\nb\nc\n", "a\nB\nc\n", {
+    review_dependencies = { fs = fs },
+  })
+  fixture.set_live("a\nb\nC\n")
+
+  local err = action(fixture, "sync_live")
+
+  h.eq("injected", err.code)
+  h.eq("a\nb\nc\n", fixture.baseline_bytes())
+  h.eq("a\nB\nc\n", fixture.workspace_bytes())
+  h.eq("pending", fixture.review:files()[1].status)
+end)
+
+h.test("refresh rejects bytes changed after their manifest snapshot", function()
+  local baseline_root, workspace_root, live_root = h.tempdir(), h.tempdir(), h.tempdir()
+  h.write(baseline_root .. "/main.txt", "old\n")
+  h.write(workspace_root .. "/main.txt", "new\n")
+  h.write(live_root .. "/main.txt", "old\n")
+  local real_manifest = require("aichatter.manifest")
+  local raced = false
+  local manifest = setmetatable({
+    scan = function(root, opts, callback)
+      real_manifest.scan(root, opts, function(err, entries)
+        if not err and root == baseline_root and not raced then
+          raced = true
+          h.write(baseline_root .. "/main.txt", "raced\n")
+        end
+        callback(err, entries)
+      end)
+    end,
+  }, { __index = real_manifest })
+  local Review = require("aichatter.review")._new({ manifest = manifest })
+  local review = Review.new({
+    baseline_root = baseline_root,
+    workspace_root = workspace_root,
+    live = require("aichatter.live").new(live_root),
+  })
+
+  local err = call(function(callback) review:refresh(callback) end)
+
+  h.truthy(err)
+  h.eq("changed", err.code)
+  h.eq({}, review:files())
+end)
+
+h.test("refresh propagates a snapshot read failure", function()
+  local baseline_root, workspace_root, live_root = h.tempdir(), h.tempdir(), h.tempdir()
+  h.write(baseline_root .. "/main.txt", "old\n")
+  h.write(workspace_root .. "/main.txt", "new\n")
+  h.write(live_root .. "/main.txt", "old\n")
+  local real_uv = vim.uv
+  local uv = setmetatable({
+    fs_open = function(target, ...)
+      if target == baseline_root .. "/main.txt" then
+        return nil, "injected read failure", "EREAD"
+      end
+      return real_uv.fs_open(target, ...)
+    end,
+  }, { __index = real_uv })
+  local Review = require("aichatter.review")._new({ uv = uv })
+  local review = Review.new({
+    baseline_root = baseline_root,
+    workspace_root = workspace_root,
+    live = require("aichatter.live").new(live_root),
+  })
+
+  local err = call(function(callback) review:refresh(callback) end)
+
+  h.truthy(err)
+  h.eq("EREAD", err.code)
+  h.eq({}, review:files())
+end)
+
+h.test("binary live bytes conflict with an outstanding accepted text record", function()
+  local fixture = h.review_fixture("old\n", "new\n")
+  h.eq(nil, action(fixture, "accept_hunk", "main.txt", 1))
+  fixture.set_live("binary\0bytes")
+
+  local err = action(fixture, "sync_live")
+
+  h.truthy(err)
+  h.eq("conflict", err.code)
+  h.eq({ "main.txt" }, err.paths)
+  h.eq("old\n", fixture.baseline_bytes())
+  h.eq("new\n", fixture.workspace_bytes())
+end)
+
+h.test("a reverted overlap can be revalidated and accepted", function()
+  local fixture = h.review_fixture("old\n", "new\n")
+  fixture.set_live("user\n")
+  h.eq("conflict", action(fixture, "accept_hunk", "main.txt", 1).code)
+  fixture.set_live("old\n")
+
+  h.eq(nil, action(fixture, "accept_hunk", "main.txt", 1))
+
+  h.eq("new\n", fixture.live_bytes())
+  h.eq("accepted", fixture.review:files()[1].status)
+end)
+
+h.test("sync clears a derived conflict after the live overlap is reverted", function()
+  local fixture = h.review_fixture("old\n", "new\n")
+  fixture.set_live("user\n")
+  h.eq("conflict", action(fixture, "accept_hunk", "main.txt", 1).code)
+  fixture.set_live("old\n")
+
+  h.eq(nil, action(fixture, "sync_live"))
+
+  h.eq("pending", fixture.review:files()[1].status)
+  h.eq("pending", fixture.review:files()[1].hunks[1].status)
+end)
+
+h.test("requires callbacks for every asynchronous review API", function()
+  local fixture = h.review_fixture("old\n", "new\n")
+
+  h.raises("callback", function() fixture.review:refresh() end)
+  h.raises("callback", function() fixture.review:sync_live() end)
+  h.raises("callback", function() fixture.review:accept_hunk("main.txt", 1) end)
+  h.raises("callback", function() fixture.review:reject_hunk("main.txt", 1) end)
+  h.raises("callback", function() fixture.review:edit_candidate("main.txt", "edit\n") end)
+  h.raises("callback", function() fixture.review:accept_file("main.txt") end)
+  h.raises("callback", function() fixture.review:reject_file("main.txt") end)
 end)

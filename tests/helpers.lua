@@ -154,6 +154,9 @@ function M.review_fixture(base_bytes, candidate_bytes, opts)
 
   local Live = require("aichatter.live")
   local Review = require("aichatter.review")
+  if opts.review_dependencies then
+    Review = Review._new(opts.review_dependencies)
+  end
   local live = Live.new(live_root)
   local live_write_count = 0
   local original_write = live.write

@@ -2,23 +2,42 @@ local default_diff = require("aichatter.diff")
 local default_fs = require("aichatter.fs")
 local default_path = require("aichatter.path")
 
-local function once(callback)
-  callback = callback or function() end
+local function require_callback(callback)
+  assert(type(callback) == "function", "callback function is required")
   local called = false
   return function(...)
-    if called then
-      return
-    end
+    if called then return end
     called = true
     pcall(callback, ...)
   end
 end
 
+local function optional_callback(callback)
+  return require_callback(callback or function() end)
+end
+
 local function error_value(err)
-  if type(err) == "table" then
-    return err
-  end
-  return { message = tostring(err) }
+  return type(err) == "table" and err or { message = tostring(err) }
+end
+
+local function same_identity(left, right)
+  return left and right and left.dev ~= nil and left.ino ~= nil
+    and left.dev == right.dev and left.ino == right.ino
+end
+
+local function identity(stat)
+  return stat and { dev = stat.dev, ino = stat.ino } or nil
+end
+
+local function same_timestamp(left, right)
+  return left and right and left.sec == right.sec and left.nsec == right.nsec
+end
+
+local function same_version(left, right)
+  return same_identity(left, right) and left.size == right.size
+    and bit.band(left.mode, 511) == bit.band(right.mode, 511)
+    and same_timestamp(left.mtime, right.mtime)
+    and same_timestamp(left.ctime, right.ctime)
 end
 
 local function new(dependencies)
@@ -31,41 +50,100 @@ local function new(dependencies)
   local Live = {}
   Live.__index = Live
 
+  local function failure(code, message)
+    return { code = code, message = message }
+  end
+
+  local function open_flags()
+    local constants = uv.constants or {}
+    if type(constants.O_RDONLY) == "number" and type(constants.O_NOFOLLOW) == "number" then
+      return bit.bor(constants.O_RDONLY, constants.O_NOFOLLOW)
+    end
+    return "r"
+  end
+
   function Live.new(root)
-    return setmetatable({ root = path.normalize(root) }, Live)
+    root = path.normalize(root)
+    local initial, err, code = uv.fs_lstat(root)
+    if not initial then
+      error(failure(code, err or "could not inspect live root"), 0)
+    elseif initial.type == "link" then
+      error(failure("symlink_root", "live root must not be a symlink"), 0)
+    elseif initial.type ~= "directory" then
+      error(failure("not_directory", "live root must be a directory"), 0)
+    end
+    local real, real_err, real_code = uv.fs_realpath(root)
+    if not real then
+      error(failure(real_code, real_err or "could not resolve live root"), 0)
+    end
+    real = path.normalize(real)
+    local anchored, anchor_err, anchor_code = uv.fs_lstat(real)
+    if not anchored or anchored.type ~= "directory" then
+      error(failure(anchor_code, anchor_err or "could not anchor live root"), 0)
+    end
+    return setmetatable({ root = real, _root_identity = identity(anchored) }, Live)
   end
 
   function Live:_resolve(relative)
     local ok, absolute = pcall(path.normalize, relative, self.root)
     if not ok or absolute == self.root or not path.is_within(self.root, absolute) then
-      return nil, {
-        code = "outside_root",
-        message = "path must resolve strictly inside the live root",
-      }
+      return nil, failure("outside_root", "path must resolve strictly inside the live root")
     end
     return absolute
+  end
+
+  function Live:_root_stat()
+    local stat, err, code = uv.fs_lstat(self.root)
+    if not stat or stat.type ~= "directory" or not same_identity(stat, self._root_identity) then
+      return nil, failure("root_changed", err or code or "live root identity changed")
+    end
+    return stat
+  end
+
+  function Live:_inspect(absolute)
+    local _, root_err = self:_root_stat()
+    if root_err then return nil, root_err end
+    local parts = {}
+    for component in path.relative(self.root, absolute):gmatch("[^/]+") do
+      parts[#parts + 1] = component
+    end
+    local current = self.root
+    for index, component in ipairs(parts) do
+      current = current .. "/" .. component
+      local stat, err, code = uv.fs_lstat(current)
+      if not stat then
+        if code == "ENOENT" then return nil end
+        return nil, failure(code, err or "could not inspect " .. current)
+      end
+      local final = index == #parts
+      if stat.type == "link" then
+        return nil, failure(final and "symlink" or "symlink_ancestor", "symlink in live path: " .. current)
+      elseif not final and stat.type ~= "directory" then
+        return nil, failure("not_directory", "non-directory ancestor: " .. current)
+      elseif final and stat.type ~= "file" then
+        return nil, failure("not_file", "live path is not a file: " .. current)
+      elseif final then
+        return stat
+      end
+    end
   end
 
   function Live:_loaded_buffer(absolute)
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_loaded(bufnr) then
         local name = vim.api.nvim_buf_get_name(bufnr)
-        if name ~= "" and path.normalize(name) == absolute then
-          return bufnr
-        end
+        if name ~= "" and path.normalize(name) == absolute then return bufnr end
       end
     end
   end
 
   function Live:loaded_paths()
-    local included = {}
-    local result = {}
+    local included, result = {}, {}
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_loaded(bufnr) then
         local name = vim.api.nvim_buf_get_name(bufnr)
         local ok, absolute = pcall(path.normalize, name)
-        if name ~= "" and ok and absolute ~= self.root
-          and path.is_within(self.root, absolute) then
+        if name ~= "" and ok and absolute ~= self.root and path.is_within(self.root, absolute) then
           local relative = path.relative(self.root, absolute)
           if not included[relative] then
             included[relative] = true
@@ -80,156 +158,261 @@ local function new(dependencies)
 
   local function buffer_bytes(bufnr)
     local bytes = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-    if vim.bo[bufnr].endofline then
-      bytes = bytes .. "\n"
+    return vim.bo[bufnr].endofline and bytes .. "\n" or bytes
+  end
+
+  function Live:_disk_snapshot(absolute)
+    local before, inspect_err = self:_inspect(absolute)
+    if inspect_err then return nil, inspect_err end
+    if not before then return { exists = false, disk_exists = false } end
+    local fd, open_err, open_code = uv.fs_open(absolute, open_flags(), 0)
+    if not fd then return nil, failure(open_code, open_err or "could not open " .. absolute) end
+    local chunks = {}
+    local ok, opened = xpcall(function()
+      local stat, stat_err, stat_code = uv.fs_fstat(fd)
+      if not stat then error(failure(stat_code, stat_err or "could not stat open file"), 0) end
+      if not same_version(before, stat) then error(failure("changed", "live file changed while opening"), 0) end
+      local offset = 0
+      while offset < stat.size do
+        local bytes, read_err, read_code = uv.fs_read(fd, math.min(65536, stat.size - offset), offset)
+        if bytes == nil then error(failure(read_code, read_err or "could not read " .. absolute), 0) end
+        if bytes == "" then break end
+        chunks[#chunks + 1] = bytes
+        offset = offset + #bytes
+      end
+      return stat
+    end, function(err) return err end)
+    local closed, close_err, close_code = uv.fs_close(fd)
+    if not ok then return nil, error_value(opened) end
+    if not closed then return nil, failure(close_code, close_err or "could not close " .. absolute) end
+    local after, after_err = self:_inspect(absolute)
+    if after_err then return nil, after_err end
+    if not after or not same_version(opened, after) then
+      return nil, failure("changed", "live file changed while reading")
     end
-    return bytes
+    local bytes = table.concat(chunks)
+    return {
+      exists = true,
+      disk_exists = true,
+      bytes = bytes,
+      disk_bytes = bytes,
+      mode = bit.band(after.mode, 511),
+      identity = identity(after),
+    }
+  end
+
+  function Live:snapshot(relative)
+    local absolute, resolve_err = self:_resolve(relative)
+    if not absolute then return nil, resolve_err end
+    local disk, disk_err = self:_disk_snapshot(absolute)
+    if disk_err then return nil, disk_err end
+    local bufnr = self:_loaded_buffer(absolute)
+    if not bufnr then return disk end
+    local ok, bytes = pcall(buffer_bytes, bufnr)
+    if not ok then return nil, error_value(bytes) end
+    return {
+      exists = true,
+      disk_exists = disk.disk_exists,
+      disk_bytes = disk.disk_bytes,
+      bytes = bytes,
+      mode = disk.mode,
+      identity = disk.identity,
+      bufnr = bufnr,
+      changedtick = vim.api.nvim_buf_get_changedtick(bufnr),
+      endofline = vim.bo[bufnr].endofline,
+      modified = vim.bo[bufnr].modified,
+    }
+  end
+
+  local function matches(expected, current)
+    if expected.exists ~= current.exists or expected.bytes ~= current.bytes or expected.mode ~= current.mode then
+      return false
+    end
+    if expected.disk_exists ~= nil and (expected.disk_exists ~= current.disk_exists
+      or expected.disk_bytes ~= current.disk_bytes) then
+      return false
+    end
+    if expected.identity and not same_identity(expected.identity, current.identity) then return false end
+    if expected.bufnr and (expected.bufnr ~= current.bufnr or expected.changedtick ~= current.changedtick) then
+      return false
+    end
+    if expected.modified ~= nil and expected.modified ~= current.modified then return false end
+    return true
+  end
+
+  function Live:_validate_expected(relative, expected)
+    local current, err = self:snapshot(relative)
+    if not current then return err or failure("changed", "live path disappeared") end
+    if not matches(expected, current) then return failure("conflict", "live path changed after validation") end
   end
 
   function Live:read(relative)
-    local absolute, resolve_err = self:_resolve(relative)
-    if not absolute then
-      return nil, resolve_err
-    end
-    local bufnr = self:_loaded_buffer(absolute)
-    if bufnr then
-      local ok, bytes = pcall(buffer_bytes, bufnr)
-      if ok then
-        return bytes
-      end
-      return nil, error_value(bytes)
-    end
-    local file, open_err = io.open(absolute, "rb")
-    if not file then
-      local stat, _, code = uv.fs_stat(absolute)
-      if not stat and code == "ENOENT" then
-        return nil
-      end
-      return nil, { code = code, message = open_err or "could not open " .. absolute }
-    end
-    local bytes = file:read("*a")
-    file:close()
-    return bytes
+    local snapshot, err = self:snapshot(relative)
+    if not snapshot then return nil, err end
+    return snapshot.exists and snapshot.bytes or nil
   end
 
   function Live:mode(relative)
-    local absolute, resolve_err = self:_resolve(relative)
-    if not absolute then
-      return nil, resolve_err
-    end
-    local stat, err, code = uv.fs_stat(absolute)
-    if not stat then
-      if code == "ENOENT" then
-        return nil
-      end
-      return nil, { code = code, message = err or "could not stat " .. absolute }
-    end
-    return bit.band(stat.mode, 511)
+    local snapshot, err = self:snapshot(relative)
+    if not snapshot then return nil, err end
+    return snapshot.mode
   end
 
-  function Live:write(relative, bytes, mode, callback)
-    callback = once(callback)
+  local function parse_guard(expected, callback)
+    if type(expected) == "function" and callback == nil then return nil, expected end
+    return expected, callback
+  end
+
+  function Live:_chmod_loaded(absolute, current, wanted)
+    if not current.disk_exists or current.mode == wanted then return end
+    local disk, disk_err = self:_disk_snapshot(absolute)
+    if disk_err then return disk_err end
+    if not disk.disk_exists or not same_identity(disk.identity, current.identity)
+      or disk.disk_bytes ~= current.disk_bytes or disk.mode ~= current.mode then
+      return failure("conflict", "live file changed before chmod")
+    end
+    local fd, open_err, open_code = uv.fs_open(absolute, open_flags(), 0)
+    if not fd then return failure(open_code, open_err or "could not open for chmod") end
+    local opened, stat_err, stat_code = uv.fs_fstat(fd)
+    local chmod_ok, chmod_err, chmod_code
+    if opened and same_identity(opened, current.identity) then
+      if uv.fs_fchmod then
+        chmod_ok, chmod_err, chmod_code = uv.fs_fchmod(fd, wanted)
+      else
+        uv.fs_close(fd)
+        return failure("unsupported", "safe descriptor-relative chmod is unavailable")
+      end
+    end
+    local closed, close_err, close_code = uv.fs_close(fd)
+    if not opened then return failure(stat_code, stat_err or "could not stat chmod file") end
+    if not same_identity(opened, current.identity) then return failure("conflict", "live file changed before chmod") end
+    if not chmod_ok then return failure(chmod_code, chmod_err or "could not chmod live file") end
+    if not closed then
+      local restore_fd, restore_open_err, restore_open_code = uv.fs_open(absolute, open_flags(), 0)
+      if not restore_fd then
+        return failure("rollback_failed", restore_open_err or restore_open_code
+          or "could not reopen file to roll back mode")
+      end
+      local restore_stat = uv.fs_fstat(restore_fd)
+      local restored, restore_err, restore_code
+      if restore_stat and same_identity(restore_stat, current.identity) then
+        restored, restore_err, restore_code = uv.fs_fchmod(restore_fd, current.mode)
+      end
+      uv.fs_close(restore_fd)
+      if not restore_stat or not same_identity(restore_stat, current.identity) or not restored then
+        return failure("rollback_failed", restore_err or restore_code
+          or "could not roll back live file mode")
+      end
+      return failure(close_code, close_err or "could not close chmod file")
+    end
+  end
+
+  function Live:write(relative, bytes, mode, expected, callback)
+    expected, callback = parse_guard(expected, callback)
     local absolute, resolve_err = self:_resolve(relative)
     if not absolute then
+      callback = require_callback(callback)
       callback(resolve_err)
       return
     end
     local bufnr = self:_loaded_buffer(absolute)
     if bufnr then
+      callback = optional_callback(callback)
+      local current, current_err = self:snapshot(relative)
+      if not current then callback(current_err); return end
+      if expected and not matches(expected, current) then
+        callback(failure("conflict", "live buffer changed after validation")); return
+      end
+      if not vim.bo[bufnr].modifiable then
+        callback(failure("unmodifiable_buffer", "loaded buffer is not modifiable")); return
+      end
+      local old_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      local old_endofline, old_modified = vim.bo[bufnr].endofline, vim.bo[bufnr].modified
       local parsed = diff.lines(bytes)
-      local ok, err = pcall(function()
-        local stat, stat_err, stat_code = uv.fs_stat(absolute)
-        if stat then
-          local wanted_mode = bit.band(mode or 420, 511)
-          if bit.band(stat.mode, 511) ~= wanted_mode then
-            local changed, chmod_err, chmod_code = uv.fs_chmod(absolute, wanted_mode)
-            if not changed then
-              error({ code = chmod_code, message = chmod_err or "could not chmod " .. absolute }, 0)
-            end
-          end
-        elseif stat_code ~= "ENOENT" then
-          error({ code = stat_code, message = stat_err or "could not stat " .. absolute }, 0)
-        end
+      local changed, change_err = pcall(function()
         vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, parsed.lines)
         vim.bo[bufnr].endofline = parsed.endofline
       end)
-      if ok then
-        callback()
+      if not changed then
+        pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, old_lines)
+        pcall(function()
+          vim.bo[bufnr].endofline = old_endofline
+          vim.bo[bufnr].modified = old_modified
+        end)
+        callback(error_value(change_err))
+        return
+      end
+      local chmod_err = self:_chmod_loaded(absolute, current, bit.band(mode or 420, 511))
+      if chmod_err then
+        pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, old_lines)
+        vim.bo[bufnr].endofline = old_endofline
+        vim.bo[bufnr].modified = old_modified
+        callback(chmod_err)
       else
-        callback(error_value(err))
+        callback()
       end
       return
     end
-    local ok, err = pcall(fs.atomic_write, absolute, bytes, mode, callback)
-    if not ok then
-      callback(error_value(err))
+
+    callback = require_callback(callback)
+    local current, current_err = self:snapshot(relative)
+    if not current then callback(current_err); return end
+    if expected and not matches(expected, current) then
+      callback(failure("conflict", "live file changed after validation")); return
     end
+    expected = expected or current
+    local ok, thrown = pcall(fs.atomic_write, absolute, bytes, mode, {
+      before_commit = function() return self:_validate_expected(relative, expected) end,
+    }, callback)
+    if not ok then callback(error_value(thrown)) end
   end
 
-  local function check_parent(root, absolute)
-    local relative = path.relative(root, vim.fs.dirname(absolute))
-    if relative == "." then
-      return
-    end
-    local current = root
-    for component in relative:gmatch("[^/]+") do
-      current = current .. "/" .. component
-      local stat, err, code = uv.fs_lstat(current)
-      if not stat then
-        if code == "ENOENT" then
-          return
-        end
-        error({ code = code, message = err or "could not inspect " .. current }, 0)
-      end
-      if stat.type == "link" then
-        error({ code = "symlink_ancestor", message = "symlink ancestor: " .. current }, 0)
-      elseif stat.type ~= "directory" then
-        error({ code = "not_directory", message = "non-directory ancestor: " .. current }, 0)
-      end
-    end
-  end
-
-  function Live:delete(relative, callback)
-    callback = once(callback)
+  function Live:delete(relative, expected, callback)
+    expected, callback = parse_guard(expected, callback)
     local absolute, resolve_err = self:_resolve(relative)
     if not absolute then
+      callback = require_callback(callback)
       callback(resolve_err)
       return
     end
     local bufnr = self:_loaded_buffer(absolute)
     if bufnr and vim.bo[bufnr].modified then
-      callback({
-        code = "modified_buffer",
-        message = "refusing to delete a modified loaded buffer",
-      })
+      callback = optional_callback(callback)
+      callback(failure("modified_buffer", "refusing to delete a modified loaded buffer"))
       return
     end
-
+    callback = require_callback(callback)
+    local current, current_err = self:snapshot(relative)
+    if not current then callback(current_err); return end
+    if expected and not matches(expected, current) then
+      callback(failure("conflict", "live path changed after validation")); return
+    end
+    expected = expected or current
     schedule(function()
-      local ok, err = xpcall(function()
-        check_parent(self.root, absolute)
-        local stat, stat_err, stat_code = uv.fs_lstat(absolute)
-        if not stat then
-          if stat_code ~= "ENOENT" then
-            error({ code = stat_code, message = stat_err or "could not stat " .. absolute }, 0)
-          end
-        elseif stat.type == "directory" then
-          error({ code = "is_directory", message = "refusing to delete directory " .. absolute }, 0)
-        else
-          local removed, remove_err, remove_code = uv.fs_unlink(absolute)
-          if not removed then
-            error({ code = remove_code, message = remove_err or "could not unlink " .. absolute }, 0)
-          end
-        end
-        if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-          vim.api.nvim_buf_delete(bufnr, { force = false })
-        end
-      end, function(value) return value end)
-      if ok then
-        callback()
-      else
-        callback(error_value(err))
+      local guard_err = self:_validate_expected(relative, expected)
+      if guard_err then callback(guard_err); return end
+      local stat, inspect_err = self:_inspect(absolute)
+      if inspect_err then callback(inspect_err); return end
+      if stat then
+        local removed, remove_err, remove_code = uv.fs_unlink(absolute)
+        if not removed then callback(failure(remove_code, remove_err or "could not unlink " .. absolute)); return end
       end
+      if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+        local deleted, delete_err = pcall(vim.api.nvim_buf_delete, bufnr, { force = false })
+        if not deleted and current.disk_exists then
+          fs.atomic_write(absolute, current.disk_bytes, current.mode or 420, {
+            before_commit = function()
+              local disk, disk_err = self:_disk_snapshot(absolute)
+              if not disk then return disk_err end
+              if disk.disk_exists then return failure("conflict", "live path recreated before rollback") end
+            end,
+          }, function(restore_err) callback(restore_err or error_value(delete_err)) end)
+          return
+        elseif not deleted then
+          callback(error_value(delete_err)); return
+        end
+      end
+      callback()
     end)
   end
 
