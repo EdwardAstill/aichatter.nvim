@@ -63,16 +63,14 @@ local function new(dependencies)
   end
 
   function Live.new(root)
-    root = path.normalize(root)
-    local initial, err, code = uv.fs_lstat(root)
+    local root_alias = path.normalize(root)
+    local initial, err, code = uv.fs_lstat(root_alias)
     if not initial then
       error(failure(code, err or "could not inspect live root"), 0)
-    elseif initial.type == "link" then
-      error(failure("symlink_root", "live root must not be a symlink"), 0)
-    elseif initial.type ~= "directory" then
+    elseif initial.type ~= "directory" and initial.type ~= "link" then
       error(failure("not_directory", "live root must be a directory"), 0)
     end
-    local real, real_err, real_code = uv.fs_realpath(root)
+    local real, real_err, real_code = uv.fs_realpath(root_alias)
     if not real then
       error(failure(real_code, real_err or "could not resolve live root"), 0)
     end
@@ -81,7 +79,11 @@ local function new(dependencies)
     if not anchored or anchored.type ~= "directory" then
       error(failure(anchor_code, anchor_err or "could not anchor live root"), 0)
     end
-    return setmetatable({ root = real, _root_identity = identity(anchored) }, Live)
+    return setmetatable({
+      root = real,
+      _root_alias = root_alias ~= real and root_alias or nil,
+      _root_identity = identity(anchored),
+    }, Live)
   end
 
   function Live:_resolve(relative)
@@ -96,6 +98,12 @@ local function new(dependencies)
     local stat, err, code = uv.fs_lstat(self.root)
     if not stat or stat.type ~= "directory" or not same_identity(stat, self._root_identity) then
       return nil, failure("root_changed", err or code or "live root identity changed")
+    end
+    if self._root_alias then
+      local alias_real, alias_err, alias_code = uv.fs_realpath(self._root_alias)
+      if not alias_real or path.normalize(alias_real) ~= self.root then
+        return nil, failure("root_changed", alias_err or alias_code or "live root alias changed")
+      end
     end
     return stat
   end
@@ -128,11 +136,23 @@ local function new(dependencies)
     end
   end
 
+  function Live:_translate_buffer_name(name)
+    local normalized = path.normalize(name)
+    if self._root_alias and (normalized == self._root_alias
+      or path.is_within(self._root_alias, normalized)) then
+      local current_alias = uv.fs_realpath(self._root_alias)
+      if not current_alias or path.normalize(current_alias) ~= self.root then return end
+      local relative = path.relative(self._root_alias, normalized)
+      return relative == "." and self.root or self.root .. "/" .. relative
+    end
+    return normalized
+  end
+
   function Live:_loaded_buffer(absolute)
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_loaded(bufnr) then
         local name = vim.api.nvim_buf_get_name(bufnr)
-        if name ~= "" and path.normalize(name) == absolute then return bufnr end
+        if name ~= "" and self:_translate_buffer_name(name) == absolute then return bufnr end
       end
     end
   end
@@ -142,8 +162,9 @@ local function new(dependencies)
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_loaded(bufnr) then
         local name = vim.api.nvim_buf_get_name(bufnr)
-        local ok, absolute = pcall(path.normalize, name)
-        if name ~= "" and ok and absolute ~= self.root and path.is_within(self.root, absolute) then
+        local ok, absolute = pcall(self._translate_buffer_name, self, name)
+        if name ~= "" and ok and absolute and absolute ~= self.root
+          and path.is_within(self.root, absolute) then
           local relative = path.relative(self.root, absolute)
           if not included[relative] then
             included[relative] = true
@@ -221,6 +242,9 @@ local function new(dependencies)
       changedtick = vim.api.nvim_buf_get_changedtick(bufnr),
       endofline = vim.bo[bufnr].endofline,
       modified = vim.bo[bufnr].modified,
+      buffer_name = vim.api.nvim_buf_get_name(bufnr),
+      modifiable = vim.bo[bufnr].modifiable,
+      readonly = vim.bo[bufnr].readonly,
     }
   end
 
@@ -233,7 +257,11 @@ local function new(dependencies)
       return false
     end
     if expected.identity and not same_identity(expected.identity, current.identity) then return false end
-    if expected.bufnr and (expected.bufnr ~= current.bufnr or expected.changedtick ~= current.changedtick) then
+    if expected.bufnr ~= current.bufnr then return false end
+    if expected.bufnr and (expected.changedtick ~= current.changedtick
+      or expected.buffer_name ~= current.buffer_name
+      or expected.modifiable ~= current.modifiable
+      or expected.readonly ~= current.readonly) then
       return false
     end
     if expected.modified ~= nil and expected.modified ~= current.modified then return false end
@@ -414,6 +442,44 @@ local function new(dependencies)
       end
       callback()
     end)
+  end
+
+  function Live:restore(relative, before, expected, callback)
+    callback = require_callback(callback)
+    local current, current_err = self:snapshot(relative)
+    if not current then callback(current_err); return end
+    if not matches(expected, current) then
+      callback(failure("conflict", "live path changed before rollback"))
+      return
+    end
+    if before.bufnr then
+      if current.bufnr ~= before.bufnr or not vim.api.nvim_buf_is_valid(before.bufnr)
+        or not vim.api.nvim_buf_is_loaded(before.bufnr) then
+        callback(failure("rollback_unavailable", "original loaded buffer no longer exists"))
+        return
+      end
+      self:write(relative, before.bytes, before.mode or 420, current, function(write_err)
+        if write_err then callback(write_err); return end
+        local restored = vim.api.nvim_buf_is_valid(before.bufnr)
+          and vim.api.nvim_buf_is_loaded(before.bufnr)
+          and vim.api.nvim_buf_get_name(before.bufnr) == before.buffer_name
+        if not restored then
+          callback(failure("rollback_unavailable", "original loaded buffer changed during rollback"))
+          return
+        end
+        local ok, state_err = pcall(function()
+          vim.bo[before.bufnr].endofline = before.endofline
+          vim.bo[before.bufnr].readonly = before.readonly
+          vim.bo[before.bufnr].modified = before.modified
+          vim.bo[before.bufnr].modifiable = before.modifiable
+        end)
+        if ok then callback() else callback(error_value(state_err)) end
+      end)
+    elseif before.exists then
+      self:write(relative, before.bytes, before.mode or 420, current, callback)
+    else
+      self:delete(relative, current, callback)
+    end
   end
 
   return Live

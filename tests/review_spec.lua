@@ -431,6 +431,31 @@ h.test("reconcile failure rolls back live baseline workspace and decision", func
   h.eq("pending", fixture.review:files()[1].hunks[1].status)
 end)
 
+h.test("reconcile rollback restores exact unmodified loaded-buffer state", function()
+  local fs = failing_fs(2)
+  local fixture = h.review_fixture("a\nb\nc\n", "a\nB\nc\n", {
+    review_dependencies = { fs = fs },
+  })
+  local filename = fixture.live_root .. "/main.txt"
+  local bufnr = h.load_buffer(filename, { "a", "b", "C" }, false)
+  vim.bo[bufnr].endofline = false
+  vim.bo[bufnr].modified = false
+
+  local err = action(fixture, "accept_hunk", "main.txt", 1)
+
+  h.eq("injected", err.code)
+  h.truthy(vim.api.nvim_buf_is_valid(bufnr))
+  h.truthy(vim.api.nvim_buf_is_loaded(bufnr))
+  h.eq(filename, vim.api.nvim_buf_get_name(bufnr))
+  h.eq({ "a", "b", "C" }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+  h.falsy(vim.bo[bufnr].endofline)
+  h.falsy(vim.bo[bufnr].modified)
+  h.eq("a\nb\nc\n", h.read(filename))
+  h.eq("a\nb\nc\n", fixture.baseline_bytes())
+  h.eq("a\nB\nc\n", fixture.workspace_bytes())
+  h.eq("pending", fixture.review:files()[1].hunks[1].status)
+end)
+
 h.test("whole-file baseline failure rolls back accepted binary live bytes", function()
   local fs = failing_fs(1)
   local fixture = h.review_fixture("old\0bytes", "new\0bytes", {
@@ -443,6 +468,43 @@ h.test("whole-file baseline failure rolls back accepted binary live bytes", func
   h.eq("old\0bytes", fixture.live_bytes())
   h.eq("old\0bytes", fixture.baseline_bytes())
   h.eq("new\0bytes", fixture.workspace_bytes())
+  h.eq("pending", fixture.review:files()[1].status)
+end)
+
+h.test("deletion preflight failure preserves the exact loaded buffer", function()
+  local real_uv = vim.uv
+  local fail_target
+  local failed = false
+  local uv = setmetatable({
+    fs_unlink = function(target)
+      if target == fail_target and not failed then
+        failed = true
+        return nil, "injected unlink failure", "EUNLINK"
+      end
+      return real_uv.fs_unlink(target)
+    end,
+  }, { __index = real_uv })
+  local fixture = h.review_fixture("old\n", nil, {
+    review_dependencies = { uv = uv },
+  })
+  local filename = fixture.live_root .. "/main.txt"
+  fail_target = fixture.baseline_root .. "/main.txt"
+  local bufnr = h.load_buffer(filename, { "old" }, false)
+  vim.bo[bufnr].endofline = true
+  vim.bo[bufnr].modified = false
+
+  local err = action(fixture, "accept_file", "main.txt")
+
+  h.eq("EUNLINK", err.code)
+  h.truthy(vim.api.nvim_buf_is_valid(bufnr))
+  h.truthy(vim.api.nvim_buf_is_loaded(bufnr))
+  h.eq(filename, vim.api.nvim_buf_get_name(bufnr))
+  h.eq({ "old" }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+  h.truthy(vim.bo[bufnr].endofline)
+  h.falsy(vim.bo[bufnr].modified)
+  h.eq("old\n", h.read(filename))
+  h.eq("old\n", fixture.baseline_bytes())
+  h.eq(nil, fixture.workspace_bytes())
   h.eq("pending", fixture.review:files()[1].status)
 end)
 

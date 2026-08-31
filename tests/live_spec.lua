@@ -157,6 +157,31 @@ h.test("guarded unloaded write rejects a file changed after validation", functio
   h.eq("user\n", h.read(root .. "/main.txt"))
 end)
 
+h.test("queued write conflicts when its unloaded path becomes loaded", function()
+  local root = h.tempdir()
+  h.write(root .. "/main.txt", "baseline\n")
+  local queued = {}
+  local schedule = function(fn) queued[#queued + 1] = fn end
+  local fs = require("aichatter.fs")._new({ schedule = schedule })
+  local InjectedLive = Live._new({ fs = fs, schedule = schedule })
+  local live = InjectedLive.new(root)
+  local expected = assert(live:snapshot("main.txt"))
+  local calls, captured = 0
+
+  live:write("main.txt", "candidate\n", 420, expected, function(err)
+    calls, captured = calls + 1, err
+  end)
+  local bufnr = h.load_buffer(root .. "/main.txt", { "baseline" }, false)
+  vim.bo[bufnr].endofline = true
+  h.eq(1, #queued)
+  queued[1]()
+
+  h.eq(1, calls)
+  h.eq("conflict", captured.code)
+  h.eq("baseline\n", h.read(root .. "/main.txt"))
+  h.eq("baseline\n", live:read("main.txt"))
+end)
+
 h.test("guarded delete rejects a file changed after validation", function()
   local root = h.tempdir()
   h.write(root .. "/main.txt", "baseline\n")
@@ -173,6 +198,30 @@ h.test("guarded delete rejects a file changed after validation", function()
   h.eq(1, calls)
   h.eq("conflict", captured.code)
   h.eq("user\n", h.read(root .. "/main.txt"))
+end)
+
+h.test("queued delete conflicts when its unloaded path becomes loaded", function()
+  local root = h.tempdir()
+  h.write(root .. "/main.txt", "baseline\n")
+  local queued = {}
+  local schedule = function(fn) queued[#queued + 1] = fn end
+  local InjectedLive = Live._new({ schedule = schedule })
+  local live = InjectedLive.new(root)
+  local expected = assert(live:snapshot("main.txt"))
+  local calls, captured = 0
+
+  live:delete("main.txt", expected, function(err)
+    calls, captured = calls + 1, err
+  end)
+  local bufnr = h.load_buffer(root .. "/main.txt", { "baseline" }, false)
+  vim.bo[bufnr].endofline = true
+  h.eq(1, #queued)
+  queued[1]()
+
+  h.eq(1, calls)
+  h.eq("conflict", captured.code)
+  h.truthy(vim.api.nvim_buf_is_loaded(bufnr))
+  h.eq("baseline\n", h.read(root .. "/main.txt"))
 end)
 
 h.test("guarded loaded delete preserves a disk edit behind the buffer", function()
@@ -286,6 +335,81 @@ h.test("scheduled write rejects an ancestor changed into a symlink", function()
   h.truthy(captured)
   h.eq("outside\n", h.read(outside .. "/file"))
   h.eq("inside\n", h.read(root .. "/old-nested/file"))
+end)
+
+h.test("reads a loaded buffer named through a symlinked root alias", function()
+  local parent = h.tempdir()
+  local actual, alias = parent .. "/actual", parent .. "/alias"
+  h.mkdir(actual)
+  h.write(actual .. "/main.txt", "disk\n")
+  h.symlink(actual, alias)
+  local bufnr = h.load_buffer(alias .. "/main.txt", { "unsaved" }, true)
+  vim.bo[bufnr].endofline = false
+
+  local live = Live.new(alias)
+
+  h.eq("unsaved", live:read("main.txt"))
+  h.eq("disk\n", h.read(actual .. "/main.txt"))
+end)
+
+h.test("writes a loaded buffer named through a symlinked root alias", function()
+  local parent = h.tempdir()
+  local actual, alias = parent .. "/actual", parent .. "/alias"
+  h.mkdir(actual)
+  h.write(actual .. "/main.txt", "disk\n")
+  h.symlink(actual, alias)
+  local bufnr = h.load_buffer(alias .. "/main.txt", { "unsaved" }, true)
+  vim.bo[bufnr].endofline = false
+  local live = Live.new(alias)
+  local calls, captured = 0
+
+  live:write("main.txt", "accepted\n", 420, function(err)
+    calls, captured = calls + 1, err
+  end)
+
+  h.eq(1, calls)
+  h.eq(nil, captured)
+  h.eq({ "accepted" }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+  h.truthy(vim.bo[bufnr].endofline)
+  h.eq("disk\n", h.read(actual .. "/main.txt"))
+end)
+
+h.test("refuses to delete an unsaved buffer named through a root alias", function()
+  local parent = h.tempdir()
+  local actual, alias = parent .. "/actual", parent .. "/alias"
+  h.mkdir(actual)
+  h.write(actual .. "/main.txt", "disk\n")
+  h.symlink(actual, alias)
+  local bufnr = h.load_buffer(alias .. "/main.txt", { "unsaved" }, true)
+  vim.bo[bufnr].endofline = false
+  local live = Live.new(alias)
+
+  local err = wait_call(function(callback) live:delete("main.txt", callback) end)
+
+  h.eq("modified_buffer", err.code)
+  h.truthy(vim.api.nvim_buf_is_loaded(bufnr))
+  h.eq({ "unsaved" }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+  h.eq("disk\n", h.read(actual .. "/main.txt"))
+end)
+
+h.test("rejects a root alias retargeted after construction", function()
+  local parent = h.tempdir()
+  local actual, outside, alias = parent .. "/actual", parent .. "/outside", parent .. "/alias"
+  h.mkdir(actual)
+  h.mkdir(outside)
+  h.write(actual .. "/main.txt", "inside\n")
+  h.write(outside .. "/main.txt", "outside\n")
+  h.symlink(actual, alias)
+  local live = Live.new(alias)
+  assert(vim.uv.fs_unlink(alias))
+  h.symlink(outside, alias)
+
+  local bytes, err = live:read("main.txt")
+
+  h.eq(nil, bytes)
+  h.eq("root_changed", err.code)
+  h.eq("inside\n", h.read(actual .. "/main.txt"))
+  h.eq("outside\n", h.read(outside .. "/main.txt"))
 end)
 
 h.test("loaded write rolls back mode when the buffer cannot change", function()

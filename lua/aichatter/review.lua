@@ -313,11 +313,7 @@ local function new(dependencies)
   end
 
   local function restore_live(self, relative, before, after, callback)
-    if before.exists then
-      self.live:write(relative, before.bytes, before.mode or 420, after, callback)
-    else
-      self.live:delete(relative, after, callback)
-    end
+    self.live:restore(relative, before, after, callback)
   end
 
   local function file_status(record)
@@ -917,7 +913,39 @@ local function new(dependencies)
         advance_baseline
       )
     else
-      self.live:delete(record.path, before, advance_baseline)
+      write_shadow(
+        self.baseline_root,
+        record.path,
+        nil,
+        record.base_mode or 420,
+        function(baseline_err)
+          if baseline_err then
+            refresh_after_failure(self, baseline_err, callback)
+            return
+          end
+          self.live:delete(record.path, before, function(live_err)
+            if not live_err then self:refresh(callback); return end
+            write_shadow(
+              self.baseline_root,
+              record.path,
+              record.base,
+              record.base_mode or 420,
+              function(rollback_err)
+                local reported = live_err
+                if rollback_err then
+                  reported = {
+                    code = "rollback_failed",
+                    message = "live deletion failed and baseline rollback was incomplete",
+                    cause = live_err,
+                    rollback = rollback_err,
+                  }
+                end
+                refresh_after_failure(self, reported, callback)
+              end
+            )
+          end)
+        end
+      )
     end
   end
 
