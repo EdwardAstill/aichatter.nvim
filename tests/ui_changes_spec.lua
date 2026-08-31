@@ -80,10 +80,49 @@ h.test("keeps action spans reachable when paths are long", function()
   })
   view:render({ one_file(path) })
   local text = h.buffer_text(view.bufnr)
-  h.truthy(#text <= 48)
+  h.truthy(vim.fn.strdisplaywidth(text) <= 48)
   h.matches("main.lua", text)
   h.matches("Open", text)
   h.truthy(view:activate_at(1, view.actions[1].open.start))
   h.eq(path, opened)
+  view:close()
+end)
+
+h.test("action spans ignore matching labels in path and status text", function()
+  local calls = {}
+  local view = require("aichatter.ui.changes").new({
+    on_open = function() calls[#calls + 1] = "open" end,
+    on_accept = function() calls[#calls + 1] = "accept" end,
+    on_reject = function() calls[#calls + 1] = "reject" end,
+  })
+  view:render({ {
+    path = "Open/✓/✕.lua",
+    additions = 1,
+    deletions = 0,
+    status = "Open ✓ ✕",
+  } })
+  local row = h.buffer_text(view.bufnr)
+  local first_open = assert(row:find("Open", 1, true)) - 1
+  local first_accept = assert(row:find("✓", 1, true)) - 1
+  local first_reject = assert(row:find("✕", 1, true)) - 1
+  h.falsy(view:activate_at(1, first_open))
+  h.falsy(view:activate_at(1, first_accept))
+  h.falsy(view:activate_at(1, first_reject))
+  h.truthy(view:activate_at(1, view.actions[1].open.start))
+  h.truthy(view:activate_at(1, view.actions[1].accept.start))
+  h.truthy(view:activate_at(1, view.actions[1].reject.start))
+  h.eq({ "open", "accept", "reject" }, calls)
+  view:close()
+end)
+
+h.test("truncates multibyte paths by display cells without invalid UTF-8", function()
+  local path = string.rep("目录/", 16) .. "界面.lua"
+  local view = require("aichatter.ui.changes").new({ width = 44 })
+  view:render({ one_file(path) })
+  local row = h.buffer_text(view.bufnr)
+  h.truthy(pcall(vim.str_utfindex, row))
+  h.truthy(vim.fn.strdisplaywidth(row) <= 44)
+  h.matches("界面.lua", row)
+  h.matches("Open", row)
   view:close()
 end)

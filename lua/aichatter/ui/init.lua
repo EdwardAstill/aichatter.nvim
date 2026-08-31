@@ -20,42 +20,54 @@ local event_names = {
   "restarted",
 }
 
+function UI:_active(generation)
+  return not self.closed and (generation == nil or generation == self.generation)
+end
+
 function UI:_files()
   if not self.session.review or type(self.session.review.files) ~= "function" then return {} end
   return self.session.review:files() or {}
 end
 
-function UI:_report_error(err)
-  if not err then return end
+function UI:_report_error(err, generation)
+  if not err or not self:_active(generation) then return end
   local entries = vim.list_slice(self.session.transcript or {})
   entries[#entries + 1] = { type = "error", error = err }
   self.transcript:render(entries)
 end
 
 function UI:_review_action(method, file)
+  if not self:_active() then return end
   local review = self.session.review
   if not review or type(review[method]) ~= "function" then return end
+  local generation = self.generation
   review[method](review, file.path, function(err)
-    self:_report_error(err)
-    if not err then self:render() end
+    if not self:_active(generation) then return end
+    self:_report_error(err, generation)
+    if not err then self:render(generation) end
   end)
 end
 
 function UI:_make_views()
+  self.generation = (self.generation or 0) + 1
+  local generation = self.generation
   local mappings = self.opts.mappings or {}
   self.transcript = Transcript.new({ schedule = self.opts.schedule })
   self.composer = Composer.new({
     mappings = mappings,
-    on_submit = self.opts.on_submit or function(text)
+    on_submit = self.opts.on_submit or function(text, complete)
+      if not self:_active(generation) then return false end
       local state = self.session.state
       if state ~= "idle" and state ~= "reviewable" then return false end
-      local synchronous, rejected = true, false
+      local finished = false
       self.session:send(text, function(err)
-        if synchronous and err then rejected = true end
-        self:_report_error(err)
+        if finished then return end
+        finished = true
+        if not self:_active(generation) then return end
+        self:_report_error(err, generation)
+        complete(not err)
       end)
-      synchronous = false
-      return not rejected
+      return "pending"
     end,
   })
   self.changes = Changes.new({
@@ -71,6 +83,7 @@ function UI:_make_views()
 end
 
 function UI:_event(name)
+  if not self:_active() then return end
   if name == "item/agentMessage/delta" then
     self.transcript:schedule_render(self.session.transcript or {})
   else
@@ -115,6 +128,7 @@ function UI:_unbind()
 end
 
 function UI:render_changes()
+  if not self:_active() then return end
   local files = self:_files()
   self.changes:render(files)
   if not self.layout then return end
@@ -128,7 +142,8 @@ function UI:render_changes()
   end
 end
 
-function UI:render()
+function UI:render(generation)
+  if not self:_active(generation) then return end
   self.transcript:render(self.session.transcript or {})
   self.composer:render(self.session.context or {})
   self:render_changes()
@@ -171,6 +186,7 @@ end
 function UI:close()
   if self.closed then return end
   self.closed = true
+  self.generation = self.generation + 1
   self:_unbind()
   if self.layout then self.layout:close() end
   self.transcript:close()
@@ -190,6 +206,7 @@ function M.new(session, opts)
     opts = opts,
     layout = nil,
     closed = false,
+    generation = 0,
   }, UI)
   self:_make_views()
   self:_bind()

@@ -14,9 +14,20 @@ local function counts(file)
 end
 
 local function visible_path(path, available)
-  if #path <= available then return path end
-  if available <= 3 then return path:sub(-available) end
-  return "..." .. path:sub(-(available - 3))
+  if available <= 0 then return "" end
+  if vim.fn.strdisplaywidth(path) <= available then return path end
+  local marker = "…"
+  local budget = available - vim.fn.strdisplaywidth(marker)
+  if budget <= 0 then return marker end
+  local tail, used = {}, 0
+  for index = vim.fn.strchars(path) - 1, 0, -1 do
+    local character = vim.fn.strcharpart(path, index, 1)
+    local width = vim.fn.strdisplaywidth(character)
+    if used + width > budget then break end
+    table.insert(tail, 1, character)
+    used = used + width
+  end
+  return marker .. table.concat(tail)
 end
 
 function Changes:_width()
@@ -28,18 +39,23 @@ end
 
 function Changes:_row(file)
   local additions, deletions = counts(file)
-  local suffix = string.format("  +%d -%d  [%s]  Open  ✓  ✕",
+  local metadata = string.format("  +%d -%d  [%s]  ",
     additions, deletions, file.status or "pending")
-  local path = visible_path(file.path or "", math.max(1, self:_width() - #suffix))
-  local row = path .. suffix
+  local labels = "Open  ✓  ✕"
+  local suffix = metadata .. labels
+  local available = self:_width() - vim.fn.strdisplaywidth(suffix)
+  local path = visible_path(file.path or "", available)
+  local row = path .. metadata
   local spans = {}
   for _, action in ipairs({
     { name = "open", label = "Open" },
     { name = "accept", label = "✓" },
     { name = "reject", label = "✕" },
   }) do
-    local first = assert(row:find(action.label, 1, true)) - 1
-    spans[action.name] = { start = first, finish = first + #action.label }
+    local first = #row
+    row = row .. action.label
+    spans[action.name] = { start = first, finish = #row }
+    if action.name ~= "reject" then row = row .. "  " end
   end
   return row, spans
 end

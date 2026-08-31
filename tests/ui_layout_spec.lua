@@ -93,3 +93,36 @@ h.test("composed UI hides an empty queue and removes event handlers", function()
   h.eq(nil, next(listeners))
   h.falsy(ui.layout)
 end)
+
+h.test("rejects tiny screens without leaking windows buffers or focus", function()
+  dimensions(20, 5, function()
+    local main_win = vim.api.nvim_get_current_win()
+    local windows = #vim.api.nvim_tabpage_list_wins(0)
+    local buffers = #vim.api.nvim_list_bufs()
+    h.raises("sidebar requires", function()
+      require("aichatter.ui.layout").open({})
+    end)
+    h.eq(windows, #vim.api.nvim_tabpage_list_wins(0))
+    h.eq(buffers, #vim.api.nvim_list_bufs())
+    h.eq(main_win, vim.api.nvim_get_current_win())
+  end)
+end)
+
+h.test("rolls back a partially opened layout when a later split fails", function()
+  local main_win = vim.api.nvim_get_current_win()
+  local windows = #vim.api.nvim_tabpage_list_wins(0)
+  local buffers = #vim.api.nvim_list_bufs()
+  local calls = 0
+  h.raises("injected split failure", function()
+    require("aichatter.ui.layout").open({
+      split = function(command)
+        calls = calls + 1
+        vim.cmd(command)
+        if calls == 2 then error("injected split failure") end
+      end,
+    })
+  end)
+  h.eq(windows, #vim.api.nvim_tabpage_list_wins(0))
+  h.eq(buffers, #vim.api.nvim_list_bufs())
+  h.eq(main_win, vim.api.nvim_get_current_win())
+end)
