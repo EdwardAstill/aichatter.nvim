@@ -99,3 +99,35 @@ h.test("waits for child exit and rejects pending requests when stopped", functio
   h.eq(nil, stop_error)
   h.truthy(transport.exited)
 end)
+
+h.test("emits an exit event when the app server ends", function()
+  local launched
+  local process = {
+    is_closing = function()
+      return false
+    end,
+    write = function() end,
+  }
+  local transport = Transport.new({
+    launcher = function(_, opts, on_exit)
+      launched = { opts = opts, on_exit = on_exit }
+      return process
+    end,
+    scheduler = function(callback)
+      callback()
+    end,
+  })
+  local exited
+
+  transport:start(function(err)
+    h.eq(nil, err)
+  end)
+  launched.opts.stdout(nil, '{"id":1,"result":{}}\n')
+  transport:on("exit", function(result)
+    exited = result
+  end)
+  launched.on_exit({ code = 23, signal = 0 })
+
+  h.eq(23, exited.code)
+  h.eq(0, exited.signal)
+end)

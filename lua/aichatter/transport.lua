@@ -95,6 +95,8 @@ function Transport:_on_exit(result)
     })
   end
 
+  self:_emit("exit", result)
+
   if self.stop_callback then
     local callback = self.stop_callback
     self.stop_callback = nil

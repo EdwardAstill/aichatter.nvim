@@ -60,6 +60,45 @@ function M.symlink(target, path)
   assert(vim.loop.fs_symlink(target, path))
 end
 
+function M.fake_transport(responses)
+  local listeners = {}
+  local transport = { responded = {} }
+
+  function transport:request(method, params, callback)
+    self.responded[#self.responded + 1] = { method = method, params = params }
+    local response = responses[method]
+    if type(response) == "function" then
+      response(params, callback)
+      return
+    end
+    callback(nil, response)
+  end
+
+  function transport:on(method, listener)
+    listeners[method] = listeners[method] or {}
+    listeners[method][#listeners[method] + 1] = listener
+  end
+
+  function transport:off(method, listener)
+    local method_listeners = listeners[method] or {}
+    for index, current in ipairs(method_listeners) do
+      if current == listener then
+        table.remove(method_listeners, index)
+        return
+      end
+    end
+  end
+
+  function transport:emit(method, params)
+    local method_listeners = listeners[method] or {}
+    for _, listener in ipairs(vim.list_slice(method_listeners)) do
+      listener(params)
+    end
+  end
+
+  return transport
+end
+
 function M.run()
   local failed = false
 
