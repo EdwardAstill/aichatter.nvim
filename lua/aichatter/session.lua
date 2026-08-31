@@ -511,6 +511,7 @@ end
 
 function Session:_on_protocol_error(params)
   local err = params and (params.error or params) or { message = "app-server error" }
+  if err.code == "unknown_notification" then return end
   self:_record_error(err)
 end
 
@@ -578,7 +579,7 @@ function Session:_start_thread(generation, operation, opts)
     ephemeral = true,
     cwd = self.shadow.workspace_root,
     approvalPolicy = "untrusted",
-    sandbox = "workspaceWrite",
+    sandbox = "workspace-write",
   }
   local completed = once(function(err, result)
     if not self:_generation_current(generation) then return end

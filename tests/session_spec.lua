@@ -85,6 +85,19 @@ h.test("rejects invalid explicit session transitions", function()
   end)
 end)
 
+h.test("keeps unhandled server notifications out of the error transcript", function()
+  local fixture = h.session_fixture({ files = {} })
+
+  fixture.transport:emit("error", {
+    code = "unknown_notification",
+    message = "received notification for an unknown method",
+    method = "remoteControl/status/changed",
+    params = { status = "disabled" },
+  })
+
+  h.eq({}, fixture.session.transcript)
+end)
+
 h.test("does not expose review until turn completion", function()
   local fixture = h.session_fixture()
   fixture.session:send("Change main.lua")
@@ -410,7 +423,7 @@ h.test("starts transport then auth then shadow then one ephemeral thread", funct
     ephemeral = true,
     cwd = "/tmp/session/workspace",
     approvalPolicy = "untrusted",
-    sandbox = "workspaceWrite",
+    sandbox = "workspace-write",
   }, requests(transport, "thread/start")[1].params)
 end)
 

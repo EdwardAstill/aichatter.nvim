@@ -35,7 +35,7 @@ local function valid_thread_start(params)
   return params.ephemeral == true
     and type(params.cwd) == "string"
     and params.approvalPolicy == "untrusted"
-    and params.sandbox == "workspaceWrite"
+    and params.sandbox == "workspace-write"
 end
 
 local function valid_turn_start(params)
