@@ -238,12 +238,7 @@ end
 function View:_decide(method)
   if self.record and self.record.file_level then
     local file_method = method == "accept_hunk" and "accept_file" or "reject_file"
-    self:_review_action(file_method, self.path, function(err)
-      if self.closed then return end
-      self:reconcile()
-      self.on_change()
-      if err then self:_notify(err) end
-    end)
+    self:_decide_remaining(file_method)
     return
   end
   local hunk = self:_current_hunk()
@@ -252,6 +247,15 @@ function View:_decide(method)
   self:_review_action(method, self.path, id, function(err)
     if self.closed then return end
     self:reconcile(id)
+    self.on_change()
+    if err then self:_notify(err) end
+  end)
+end
+
+function View:_decide_remaining(method)
+  self:_review_action(method, self.path, function(err)
+    if self.closed then return end
+    self:reconcile()
     self.on_change()
     if err then self:_notify(err) end
   end)
@@ -342,6 +346,8 @@ function M.open(review, relative, opts)
   local mappings = vim.tbl_extend("force", {
     accept = config.mappings.accept,
     reject = config.mappings.reject,
+    accept_remaining = config.mappings.accept_remaining,
+    reject_remaining = config.mappings.reject_remaining,
     edit = config.mappings.edit,
     previous_hunk = config.mappings.previous_hunk,
     next_hunk = config.mappings.next_hunk,
@@ -396,6 +402,12 @@ function M.open(review, relative, opts)
     { buffer = bufnr, silent = true })
   vim.keymap.set("n", "<Plug>(AIChatterReviewReject)", function() self:_decide("reject_hunk") end,
     { buffer = bufnr, silent = true })
+  vim.keymap.set("n", "<Plug>(AIChatterReviewAcceptRemaining)",
+    function() self:_decide_remaining("accept_file") end,
+    { buffer = bufnr, silent = true })
+  vim.keymap.set("n", "<Plug>(AIChatterReviewRejectRemaining)",
+    function() self:_decide_remaining("reject_file") end,
+    { buffer = bufnr, silent = true })
   vim.keymap.set("n", "<Plug>(AIChatterReviewEdit)", function() self:_open_candidate() end,
     { buffer = bufnr, silent = true })
   vim.keymap.set("n", mappings.previous_hunk, "<Plug>(AIChatterReviewPreviousHunk)",
@@ -406,12 +418,18 @@ function M.open(review, relative, opts)
     { buffer = bufnr, silent = true, remap = true })
   vim.keymap.set("n", mappings.reject, "<Plug>(AIChatterReviewReject)",
     { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("n", mappings.accept_remaining, "<Plug>(AIChatterReviewAcceptRemaining)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("n", mappings.reject_remaining, "<Plug>(AIChatterReviewRejectRemaining)",
+    { buffer = bufnr, silent = true, remap = true })
   vim.keymap.set("n", mappings.edit, "<Plug>(AIChatterReviewEdit)",
     { buffer = bufnr, silent = true, remap = true })
   Help.map(bufnr, "Review Hunks", {
     mappings.previous_hunk .. " / " .. mappings.next_hunk .. "  Previous / next hunk",
     mappings.accept .. "       Accept current hunk",
     mappings.reject .. "       Reject current hunk",
+    mappings.accept_remaining .. "       Accept remaining hunks",
+    mappings.reject_remaining .. "       Reject remaining hunks",
     mappings.edit .. "       Edit complete candidate",
     "q       Hide review",
     "?       Show this help",

@@ -55,6 +55,8 @@ require("aichatter").setup({
     open = "o",
     accept = "a",
     reject = "r",
+    accept_remaining = "A",
+    reject_remaining = "R",
     edit = "e",
     previous_hunk = "[c",
     next_hunk = "]c",
@@ -85,8 +87,9 @@ The plugin installs no mandatory global mappings. Its defaults are buffer-local:
 - Composer: `<CR>` submits and `<C-j>` inserts a newline.
 - Changed-file queue: `<CR>` or `o` opens a floating review, `a` accepts the
   file, and `r` rejects it. The active row uses a full-line selection highlight.
-- Hunk review: `[c`/`]c` move between pending hunks, `a` accepts, `r` rejects,
-  and `e` edits the complete candidate in an `acwrite` buffer.
+- Hunk review: `[c`/`]c` move between pending hunks, `a`/`r` accept or reject
+  the current hunk, `A`/`R` accept or reject all remaining hunks, and `e`
+  edits the complete candidate in an `acwrite` buffer.
 - Any AI Chatter buffer: `?` opens context-specific mapping help; `q`, `<Esc>`,
   or `?` closes the help window.
 
@@ -95,7 +98,8 @@ mappings can reuse the plugin action: `AIChatterComposerSubmit`,
 `AIChatterComposerNewline`, `AIChatterChangesOpen`, `AIChatterChangesAccept`,
 `AIChatterChangesReject`, `AIChatterReviewPreviousHunk`,
 `AIChatterReviewNextHunk`, `AIChatterReviewAccept`, `AIChatterReviewReject`,
-and `AIChatterReviewEdit`.
+`AIChatterReviewAcceptRemaining`, `AIChatterReviewRejectRemaining`, and
+`AIChatterReviewEdit`.
 
 ## Safety and unsaved buffers
 

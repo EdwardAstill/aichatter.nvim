@@ -10,6 +10,17 @@ local function maparg(bufnr, mode, lhs)
   return vim.fn.maparg(lhs, mode, false, true)
 end
 
+local function accept_first_hunk(fixture)
+  local record = fixture.review:files()[1]
+  local completed, failure = false, nil
+  fixture.review:accept_hunk(fixture.relative, record.hunks[1].id, function(err)
+    failure = err
+    completed = true
+  end)
+  h.truthy(h.wait_for(function() return completed end, 3000))
+  h.eq(nil, failure)
+end
+
 h.test("renders unified context with green additions and red deletions", function()
   local review = h.fake_review({
     path = "main.lua",
@@ -34,11 +45,48 @@ h.test("maps review defaults through documented plug mappings", function()
 
   h.eq("<Plug>(AIChatterReviewAccept)", maparg(view.bufnr, "n", "a").rhs)
   h.eq("<Plug>(AIChatterReviewReject)", maparg(view.bufnr, "n", "r").rhs)
+  h.eq("<Plug>(AIChatterReviewAcceptRemaining)", maparg(view.bufnr, "n", "A").rhs)
+  h.eq("<Plug>(AIChatterReviewRejectRemaining)", maparg(view.bufnr, "n", "R").rhs)
   h.eq("<Plug>(AIChatterReviewEdit)", maparg(view.bufnr, "n", "e").rhs)
   h.truthy(maparg(view.bufnr, "n", "?").callback ~= nil)
   h.truthy(maparg(view.bufnr, "n", "<Plug>(AIChatterReviewAccept)").callback ~= nil)
   h.truthy(maparg(view.bufnr, "n", "<Plug>(AIChatterReviewReject)").callback ~= nil)
+  h.truthy(maparg(view.bufnr, "n", "<Plug>(AIChatterReviewAcceptRemaining)").callback ~= nil)
+  h.truthy(maparg(view.bufnr, "n", "<Plug>(AIChatterReviewRejectRemaining)").callback ~= nil)
   h.truthy(maparg(view.bufnr, "n", "<Plug>(AIChatterReviewEdit)").callback ~= nil)
+  view:close()
+end)
+
+h.test("Shift-A accepts every remaining hunk", function()
+  local fixture = h.review_fixture(
+    "one\nkeep\nthree\n", "ONE\nkeep\nTHREE\n")
+  accept_first_hunk(fixture)
+  local view = require("aichatter.ui.diff").open(
+    fixture.review, fixture.relative)
+
+  h.invoke_mapping(view.bufnr, "n", "A")
+
+  h.truthy(h.wait_for(function()
+    return fixture.live_bytes() == "ONE\nkeep\nTHREE\n"
+      and #fixture.review:files() == 0
+  end, 3000))
+  view:close()
+end)
+
+h.test("Shift-R rejects every remaining hunk", function()
+  local fixture = h.review_fixture(
+    "one\nkeep\nthree\n", "ONE\nkeep\nTHREE\n")
+  accept_first_hunk(fixture)
+  local view = require("aichatter.ui.diff").open(
+    fixture.review, fixture.relative)
+
+  h.invoke_mapping(view.bufnr, "n", "R")
+
+  h.truthy(h.wait_for(function()
+    return fixture.live_bytes() == "ONE\nkeep\nthree\n"
+      and fixture.workspace_bytes() == "ONE\nkeep\nthree\n"
+      and #fixture.review:files() == 0
+  end, 3000))
   view:close()
 end)
 
