@@ -23,6 +23,22 @@ function M.matches(pattern, value)
   assert(string.match(value, pattern), string.format("expected %s to match %s", value, pattern))
 end
 
+function M.buffer_text(bufnr)
+  return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+end
+
+function M.invoke_mapping(bufnr, mode, lhs)
+  vim.api.nvim_set_current_buf(bufnr)
+  if mode == "i" then vim.cmd("startinsert") end
+  local keys = vim.keycode(lhs)
+  if mode == "i" and vim.api.nvim_get_mode().mode ~= "i" then
+    keys = "i" .. keys
+  end
+  vim.api.nvim_feedkeys(keys, "mx", false)
+  vim.wait(50)
+  if mode == "i" then vim.cmd("stopinsert") end
+end
+
 function M.raises(pattern, fn)
   local ok, err = pcall(fn)
   assert(not ok, "expected function to raise an error")
