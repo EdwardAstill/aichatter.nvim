@@ -7,7 +7,8 @@ function M.test(name, fn)
 end
 
 function M.eq(expected, actual)
-  assert(expected == actual, string.format("expected %s, got %s", vim.inspect(expected), vim.inspect(actual)))
+  assert(vim.deep_equal(expected, actual),
+    string.format("expected %s, got %s", vim.inspect(expected), vim.inspect(actual)))
 end
 
 function M.truthy(value)
@@ -30,6 +31,24 @@ end
 
 function M.wait_for(predicate, timeout_ms)
   return vim.wait(timeout_ms, predicate, 10)
+end
+
+function M.scan_changes(base, candidate)
+  local manifest = require("aichatter.manifest")
+  local before, after
+  local before_error, after_error
+  manifest.scan(base, {}, function(err, value)
+    before_error, before = err, value
+  end)
+  manifest.scan(candidate, {}, function(err, value)
+    after_error, after = err, value
+  end)
+  assert(M.wait_for(function()
+    return before_error ~= nil or after_error ~= nil or (before ~= nil and after ~= nil)
+  end, 2000), "timed out scanning manifests")
+  assert(not before_error, vim.inspect(before_error))
+  assert(not after_error, vim.inspect(after_error))
+  return manifest.compare(before, after)
 end
 
 function M.tempdir()
