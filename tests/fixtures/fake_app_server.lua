@@ -42,6 +42,7 @@ local function valid_turn_start(params)
   return params.threadId == thread_id
     and type(params.input) == "table"
     and params.sandboxPolicy == nil
+    and (scenario ~= "model-selection" or params.model == "gpt-5.6-terra")
 end
 
 local function crash_marker()
@@ -92,8 +93,40 @@ for line in io.lines() do
       reject(message, "invalid ephemeral shadow thread policy")
     else
       thread_cwd = message.params.cwd
-      respond(message, { thread = { id = thread_id } })
+      respond(message, { thread = { id = thread_id, model = "gpt-5.6-sol" } })
     end
+  elseif message.method == "model/list" then
+    respond(message, {
+      data = {
+        {
+          id = "gpt-5.6-sol",
+          model = "gpt-5.6-sol",
+          displayName = "GPT-5.6-Sol",
+          hidden = false,
+          defaultReasoningEffort = "low",
+          supportedReasoningEfforts = {
+            { reasoningEffort = "low", description = "Fast responses" },
+          },
+          inputModalities = { "text", "image" },
+          supportsPersonality = true,
+          isDefault = true,
+        },
+        {
+          id = "gpt-5.6-terra",
+          model = "gpt-5.6-terra",
+          displayName = "GPT-5.6-Terra",
+          hidden = false,
+          defaultReasoningEffort = "medium",
+          supportedReasoningEfforts = {
+            { reasoningEffort = "medium", description = "Balanced reasoning" },
+          },
+          inputModalities = { "text", "image" },
+          supportsPersonality = true,
+          isDefault = false,
+        },
+      },
+      nextCursor = vim.NIL,
+    })
   elseif message.method == "turn/start" then
     if not valid_turn_start(message.params) then
       reject(message, "invalid inherited permission profile")

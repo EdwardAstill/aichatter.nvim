@@ -19,6 +19,7 @@ local event_names = {
   "turn/completed",
   "restart",
   "restarted",
+  "model",
 }
 
 function UI:_active(generation)
@@ -103,7 +104,8 @@ function UI:_render_state()
   if self.transcript and self.transcript.winid
       and vim.api.nvim_win_is_valid(self.transcript.winid) then
     vim.wo[self.transcript.winid].statusline =
-      " AIChatter · " .. tostring(self.state or "closed") .. " "
+      " AIChatter · " .. tostring(self.state or "closed") .. " · "
+      .. tostring(self.session.model or "Codex default") .. " "
   end
 end
 
@@ -178,8 +180,10 @@ function UI:_event(name, value)
     self.transcript:render(self.session.transcript or {})
   end
   self.composer:render(self.session.context or {})
-  if name == "state" then
+  if name == "state" or name == "model" then
     self:_render_state()
+  end
+  if name == "state" then
     self:_reconcile_review()
   elseif name == "turn/completed" then
     self:render_changes()

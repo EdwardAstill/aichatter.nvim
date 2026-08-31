@@ -184,6 +184,8 @@ function Session.new(deps)
     emit = deps.emit or noop,
     thread_id = nil,
     turn_id = nil,
+    model = nil,
+    models = nil,
     transcript = deps.transcript or {},
     pending_commands = {},
     handlers = {},
@@ -593,6 +595,8 @@ function Session:_start_thread(generation, operation, opts)
       return
     end
     self.thread_id = thread_id
+    local model = result.thread.model
+    if type(model) == "string" and model ~= "" then self.model = model end
     local target = opts.target or "idle"
     self:_transition(target)
     if opts.restarting then self:_emit("restarted", { threadId = thread_id }) end
@@ -601,6 +605,34 @@ function Session:_start_thread(generation, operation, opts)
   local ok, thrown = pcall(self.transport.request, self.transport,
     "thread/start", params, completed)
   if not ok then completed(error_value(thrown)) end
+end
+
+function Session:list_models(callback)
+  callback = public_callback(callback)
+  if self.disposed then callback(state_error("session is disposed")); return end
+  local completed = once(function(err, result)
+    if err then callback(error_value(err)); return end
+    local models = result and result.data
+    if type(models) ~= "table" then
+      callback({ message = "model/list returned no models" })
+      return
+    end
+    self.models = models
+    callback(nil, models)
+  end)
+  local ok, thrown = pcall(self.transport.request, self.transport,
+    "model/list", { limit = 100, includeHidden = false }, completed)
+  if not ok then completed(error_value(thrown)) end
+end
+
+function Session:select_model(model)
+  if self.disposed then return nil, state_error("session is disposed") end
+  if type(model) ~= "string" or vim.trim(model) == "" then
+    return nil, { code = "invalid_model", message = "model must not be blank" }
+  end
+  self.model = vim.trim(model)
+  self:_emit("model", self.model)
+  return true
 end
 
 function Session:_ensure_workspace(generation, operation, opts)
@@ -864,6 +896,7 @@ function Session:send(text, callback)
       threadId = self.thread_id,
       input = inputs,
     }
+    if self.model then params.model = self.model end
     local ok, thrown = pcall(self.transport.request, self.transport,
       "turn/start", params, completed)
     if not ok then completed(error_value(thrown)) end

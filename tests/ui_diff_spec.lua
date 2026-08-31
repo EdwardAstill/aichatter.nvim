@@ -275,7 +275,7 @@ h.test("registers the approved commands exactly once", function()
   dofile("plugin/aichatter.lua")
   dofile("plugin/aichatter.lua")
   for _, name in ipairs({
-    "AIChat", "AIChatLogin", "AIChatAddFile",
+    "AIChat", "AIChatToggle", "AIChatModel", "AIChatLogin", "AIChatAddFile",
     "AIChatAddSelection", "AIChatCancel", "AIChatClose",
   }) do
     h.eq(2, vim.fn.exists(":" .. name))

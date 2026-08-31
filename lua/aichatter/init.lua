@@ -137,6 +137,36 @@ function M.login()
   end)
 end
 
+function M.model(value)
+  local active = create_instance()
+  active.ui:open()
+  start(active, function(err)
+    if err then return end
+    local function select_model(model)
+      if not model then return end
+      local id = type(model) == "table" and (model.model or model.id) or model
+      local ok, model_err = active.session:select_model(id)
+      if not ok then notify_error(model_err) end
+    end
+    if value and vim.trim(value) ~= "" then
+      select_model(value)
+      return
+    end
+    active.session:list_models(function(list_err, models)
+      if instance ~= active or active.session.disposed then return end
+      if list_err then notify_error(list_err); return end
+      vim.ui.select(models, {
+        prompt = "Select AI Chatter model",
+        format_item = function(model)
+          return model.displayName or model.model or model.id
+        end,
+      }, protected(function(selected)
+        if instance == active and not active.session.disposed then select_model(selected) end
+      end))
+    end)
+  end)
+end
+
 function M.add_file(value)
   with_context(function(active)
     local root = active.session.context.root
@@ -218,6 +248,15 @@ function M._register_commands()
   commands_registered = true
   vim.api.nvim_create_user_command("AIChat", protected(function() M.toggle() end), {
     desc = "Toggle the AI Chatter sidebar",
+  })
+  vim.api.nvim_create_user_command("AIChatToggle", protected(function() M.toggle() end), {
+    desc = "Toggle the AI Chatter sidebar",
+  })
+  vim.api.nvim_create_user_command("AIChatModel", protected(function(command)
+    M.model(command.args)
+  end), {
+    nargs = "?",
+    desc = "Select the AI Chatter Codex model",
   })
   vim.api.nvim_create_user_command("AIChatLogin", protected(function() M.login() end), {
     desc = "Sign in to Codex with ChatGPT",

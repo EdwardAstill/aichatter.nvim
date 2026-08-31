@@ -94,6 +94,20 @@ h.test("composed UI hides an empty queue and removes event handlers", function()
   h.falsy(ui.layout)
 end)
 
+h.test("displays the selected model in the sidebar status line", function()
+  local fixture = h.session_fixture({ files = {} })
+  fixture.session.model = "gpt-5.6-sol"
+  local ui = require("aichatter.ui").new(fixture.session, {})
+  ui:open()
+
+  h.matches("gpt%-5%.6%-sol", vim.wo[ui.transcript.winid].statusline)
+  fixture.session.model = "gpt-5.6-terra"
+  fixture.session:_emit("model", "gpt-5.6-terra")
+  h.matches("gpt%-5%.6%-terra", vim.wo[ui.transcript.winid].statusline)
+
+  ui:close()
+end)
+
 h.test("prompts once for a command approval that arrived while hidden", function()
   local fixture = h.session_fixture({
     state = "running",

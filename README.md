@@ -67,11 +67,18 @@ require("aichatter").setup({
 | Command | Action |
 | --- | --- |
 | `:AIChat` | Toggle the single chat sidebar, creating its session on first use. |
+| `:AIChatToggle` | Open or hide the chat sidebar without discarding its session or drafts. |
+| `:AIChatModel` | Select an available Codex model from a picker. |
+| `:AIChatModel <model>` | Use a model ID for future messages in the current chat session. |
 | `:AIChatLogin` | Start Codex's managed ChatGPT browser sign-in. |
 | `:AIChatAddFile [path]` | Add a contained regular project file; without a path, select one. |
 | `:AIChatAddSelection` | Add the exact lines between the last visual marks. |
 | `:AIChatCancel` | Interrupt the active Codex turn. |
 | `:AIChatClose` | Stop Codex and remove the validated temporary session directory. |
+
+The transcript status line shows the session state and selected model. Changing
+models does not interrupt an active response; the selection applies to future
+messages and is discarded when the chat session closes.
 
 The plugin installs no mandatory global mappings. Its defaults are buffer-local:
 

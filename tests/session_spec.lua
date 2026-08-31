@@ -195,6 +195,55 @@ h.test("inherits the thread permission profile instead of overriding turn sandbo
   }, requests(fixture.transport, "turn/start")[1].params)
 end)
 
+h.test("lists picker-visible Codex models", function()
+  local fixture = h.session_fixture({
+    responses = {
+      ["model/list"] = {
+        data = {
+          {
+            id = "gpt-5.6-sol",
+            model = "gpt-5.6-sol",
+            displayName = "GPT-5.6-Sol",
+            hidden = false,
+            defaultReasoningEffort = "low",
+            supportedReasoningEfforts = {
+              { reasoningEffort = "low", description = "Fast responses" },
+            },
+            inputModalities = { "text", "image" },
+            supportsPersonality = true,
+            isDefault = true,
+          },
+        },
+        nextCursor = vim.NIL,
+      },
+    },
+  })
+  h.truthy(type(fixture.session.list_models) == "function")
+  local models
+
+  fixture.session:list_models(function(err, value)
+    h.eq(nil, err)
+    models = value
+  end)
+
+  h.eq("gpt-5.6-sol", models[1].id)
+  h.eq({ limit = 100, includeHidden = false },
+    requests(fixture.transport, "model/list")[1].params)
+end)
+
+h.test("applies a selected model to future turns", function()
+  local fixture = h.session_fixture({ files = {} })
+  h.truthy(type(fixture.session.select_model) == "function")
+
+  fixture.session:select_model("gpt-5.6-terra")
+  fixture.session:send("Use the selected model")
+
+  h.eq("gpt-5.6-terra", fixture.session.model)
+  h.eq("gpt-5.6-terra", requests(fixture.transport, "turn/start")[1].params.model)
+  h.eq("model", fixture.events[1].name)
+  h.eq("gpt-5.6-terra", fixture.events[1].value)
+end)
+
 h.test("refreshes proposals after failed and interrupted turn completion", function()
   for _, status in ipairs({ "failed", "interrupted" }) do
     local fixture = h.session_fixture()

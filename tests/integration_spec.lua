@@ -210,6 +210,59 @@ h.test("opens the managed browser login URL without handling credentials", funct
   close_chat()
 end)
 
+h.test("AIChatToggle hides and restores the same chat", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  configure(root, "authenticated")
+
+  h.eq(2, vim.fn.exists(":AIChatToggle"))
+  vim.cmd("AIChatToggle")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+  local composer = assert(buffer("aichatter-composer"))
+  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "draft" })
+
+  vim.cmd("AIChatToggle")
+  h.eq(nil, window_for(composer))
+  vim.cmd("AIChatToggle")
+  h.truthy(window_for(composer))
+  h.eq("draft", h.buffer_text(composer))
+
+  close_chat()
+end)
+
+h.test("AIChatModel picker displays and selects an available model", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  local old_select = vim.ui.select
+  configure(root, "authenticated")
+  vim.cmd("AIChat")
+  h.truthy(h.wait_for(function() return status_is("gpt-5.6-sol") end, 5000))
+  vim.ui.select = function(items, opts, callback)
+    h.eq("Select AI Chatter model", opts.prompt)
+    h.eq("gpt-5.6-sol", items[1].id)
+    h.eq("gpt-5.6-terra", items[2].id)
+    callback(items[2])
+  end
+
+  vim.cmd("AIChatModel")
+
+  h.truthy(h.wait_for(function() return status_is("gpt-5.6-terra") end, 3000))
+  vim.ui.select = old_select
+  close_chat()
+end)
+
+h.test("AIChatModel argument displays and uses the model for the next turn", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  configure(root, "model-selection")
+  vim.cmd("AIChat")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+
+  vim.cmd("AIChatModel gpt-5.6-terra")
+  h.truthy(status_is("gpt-5.6-terra"))
+  submit("Use Terra")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+
+  close_chat()
+end)
+
 h.test("routes an explicit command approval decision through the sidebar", function()
   local root = h.git_project({ ["main.lua"] = "return true\n" })
   local selections = 0
