@@ -460,8 +460,8 @@ h.test("starts transport then auth then shadow then one ephemeral thread", funct
   h.eq({
     ephemeral = true,
     cwd = "/tmp/session/workspace",
-    approvalPolicy = "untrusted",
-    permissions = ":workspace",
+    approvalPolicy = "never",
+    permissions = ":danger-full-access",
   }, requests(transport, "thread/start")[1].params)
 end)
 

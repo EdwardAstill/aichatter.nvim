@@ -19,6 +19,14 @@ h.test("creates transcript, changes, and 20 percent composer windows", function(
       vim.api.nvim_win_get_width(layout.composer_win))
     h.eq(10, vim.api.nvim_win_get_height(layout.composer_win))
     h.truthy(vim.api.nvim_win_is_valid(layout.changes_win))
+    for _, winid in ipairs({
+      layout.transcript_win, layout.changes_win, layout.composer_win,
+    }) do
+      h.eq("", vim.wo[winid].statuscolumn)
+    end
+    h.truthy(vim.wo[layout.changes_win].cursorline)
+    h.eq("line", vim.wo[layout.changes_win].cursorlineopt)
+    h.matches("CursorLine:PmenuSel", vim.wo[layout.changes_win].winhighlight)
     layout:close()
   end)
 end)
@@ -94,6 +102,48 @@ h.test("composed UI hides an empty queue and removes event handlers", function()
   h.falsy(ui.layout)
 end)
 
+h.test("maps contextual help in every primary chat buffer", function()
+  local fixture = h.session_fixture({ files = {} })
+  local ui = require("aichatter.ui").new(fixture.session, {})
+
+  for _, bufnr in ipairs({
+    ui.transcript.bufnr, ui.changes.bufnr, ui.composer.bufnr,
+  }) do
+    vim.api.nvim_set_current_buf(bufnr)
+    h.truthy(vim.fn.maparg("?", "n", false, true).callback ~= nil)
+  end
+
+  ui:close()
+end)
+
+h.test("opens file review in a centered float without replacing the editor buffer", function()
+  local review = h.fake_review({
+    path = "main.lua",
+    base = "old\n",
+    candidate = "new\n",
+  })
+  local fixture = h.session_fixture({ review = review, files = { review.record } })
+  local ui = require("aichatter.ui").new(fixture.session, {})
+  local main_win = vim.api.nvim_get_current_win()
+  local main_buf = vim.api.nvim_win_get_buf(main_win)
+  ui:open()
+
+  ui:_open_review(review.record)
+
+  local review_win = ui.diff_view.winid
+  local config = vim.api.nvim_win_get_config(review_win)
+  h.eq("editor", config.relative)
+  h.eq(main_buf, vim.api.nvim_win_get_buf(main_win))
+  h.eq(ui.diff_view.bufnr, vim.api.nvim_win_get_buf(review_win))
+  h.invoke_mapping(ui.diff_view.bufnr, "n", "q")
+  h.falsy(vim.api.nvim_win_is_valid(review_win))
+  ui:_open_review(review.record)
+  h.truthy(vim.api.nvim_win_is_valid(ui.diff_view.winid))
+  local reopened_win = ui.diff_view.winid
+  ui:close()
+  h.falsy(vim.api.nvim_win_is_valid(reopened_win))
+end)
+
 h.test("displays the selected model in the sidebar status line", function()
   local fixture = h.session_fixture({ files = {} })
   fixture.session.model = "gpt-5.6-sol"
@@ -162,11 +212,13 @@ h.test("toggle hides and restores composer and candidate draft buffers", functio
   h.invoke_mapping(ui.diff_view.bufnr, "n", "e")
   local composer = ui.composer.bufnr
   local candidate = ui.diff_view.candidate_bufnr
+  local review_win = ui.diff_view.winid
   vim.api.nvim_buf_set_lines(candidate, 0, -1, false, { "local candidate draft" })
   vim.bo[candidate].modified = true
 
   ui:toggle()
 
+  h.falsy(vim.api.nvim_win_is_valid(review_win))
   h.truthy(vim.api.nvim_buf_is_valid(composer))
   h.truthy(vim.api.nvim_buf_is_valid(candidate))
   h.eq({ "draft prompt" }, vim.api.nvim_buf_get_lines(composer, 0, -1, false))
@@ -175,6 +227,7 @@ h.test("toggle hides and restores composer and candidate draft buffers", functio
 
   ui:toggle()
 
+  h.truthy(vim.api.nvim_win_is_valid(ui.diff_view.winid))
   h.eq(composer, ui.composer.bufnr)
   h.eq(candidate, ui.diff_view.candidate_bufnr)
   h.eq({ "draft prompt" }, vim.api.nvim_buf_get_lines(ui.composer.bufnr, 0, -1, false))

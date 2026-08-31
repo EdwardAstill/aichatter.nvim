@@ -3,6 +3,7 @@ local Transcript = require("aichatter.ui.transcript")
 local Composer = require("aichatter.ui.composer")
 local Changes = require("aichatter.ui.changes")
 local Diff = require("aichatter.ui.diff")
+local Help = require("aichatter.ui.help")
 
 local UI = {}
 UI.__index = UI
@@ -65,6 +66,7 @@ function UI:_open_review(file)
   if not self:_active() or not self.layout then return end
   if self.diff_view then
     if self.diff_view.path == file.path then
+      self.diff_view:show()
       self.diff_view:reconcile()
       return
     end
@@ -78,11 +80,8 @@ function UI:_open_review(file)
     end
     self.diff_view:close()
   end
-  local winid = self.layout.main_win
-  if not winid or not vim.api.nvim_win_is_valid(winid) then return end
-  vim.api.nvim_set_current_win(winid)
   local ok, value = pcall(Diff.open, self.session.review, file.path, {
-    winid = winid,
+    float = true,
     mappings = self.opts.mappings,
     notify = self.opts.notify or vim.notify,
     on_action = type(self.session.review_action) == "function" and function(method, ...)
@@ -169,6 +168,20 @@ function UI:_make_views()
     on_reject = self.opts.on_reject or function(file)
       self:_review_action("reject_file", file)
     end,
+  })
+  Help.map(self.transcript.bufnr, "AI Chatter", {
+    ":AIChatToggle       Toggle sidebar",
+    ":AIChatModel        Choose Codex model",
+    ":AIChatAddFile      Add project file",
+    ":AIChatAddSelection Add visual selection",
+    ":AIChatCancel       Cancel active response",
+    ":AIChatClose        Close session",
+  })
+  Help.map(self.composer.bufnr, "Compose Message", {
+    "i                    Edit prompt",
+    tostring(mappings.submit or "<CR>") .. " (insert)        Submit prompt",
+    tostring(mappings.newline or "<C-j>") .. " (insert)       Insert newline",
+    "?                    Show this help",
   })
 end
 
@@ -275,6 +288,7 @@ function UI:open()
   self:render()
   self:_render_state()
   self:_reconcile_command_approvals()
+  if self.diff_view then self.diff_view:show() end
   return self
 end
 
@@ -288,6 +302,7 @@ end
 
 function UI:hide()
   if not self.layout then return end
+  if self.diff_view then self.diff_view:hide() end
   self.layout:close()
   self.layout = nil
   self.transcript.winid = nil
@@ -301,6 +316,7 @@ function UI:close()
   self.closed = true
   self.generation = self.generation + 1
   self:_unbind()
+  Help.close()
   if self.diff_view then self.diff_view:close() end
   self.diff_view = nil
   if self.layout then self.layout:close() end

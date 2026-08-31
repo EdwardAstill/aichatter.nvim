@@ -110,7 +110,7 @@ h.test("composes sidebar shadow turn hunk review and confirmed cleanup end to en
     h.buffer_text(live))
 
   vim.api.nvim_set_current_win(assert(window_for(changes)))
-  h.invoke_mapping(changes, "n", "o")
+  h.invoke_mapping(changes, "n", "<CR>")
   local diff_buf = assert(buffer("aichatter-diff"), "diff buffer not found")
   local namespace = assert(vim.api.nvim_get_namespaces()["aichatter-diff-" .. diff_buf])
   local extmarks = vim.api.nvim_buf_get_extmarks(
@@ -425,7 +425,7 @@ h.test("refreshes crash-after-write proposals and continues in the restarted pro
   h.eq("base\n", h.read(root .. "/main.lua"))
 
   vim.api.nvim_set_current_win(assert(window_for(changes)))
-  h.invoke_mapping(changes, "n", "o")
+  h.invoke_mapping(changes, "n", "<CR>")
   local diff_buf = assert(buffer("aichatter-diff"), "diff buffer not found")
   h.matches("%+partial", h.buffer_text(diff_buf))
 

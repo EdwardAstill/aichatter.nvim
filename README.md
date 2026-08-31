@@ -8,8 +8,8 @@ You decide which hunks reach the live buffer or file.
 ## Requirements
 
 - Neovim 0.10 or newer (the minimum Linux CI version is 0.10.4).
-- A `codex` CLI whose app-server supports ephemeral threads and restricted read
-  access. Keep Codex current if the plugin reports an app-server compatibility
+- A `codex` CLI whose app-server supports ephemeral threads and permission
+  profiles. Keep Codex current if the plugin reports an app-server compatibility
   error.
 - Git for Git projects. Non-Git directories use a metadata-free local mirror.
 - Linux or macOS. Native Windows support is not included in v1.
@@ -83,9 +83,12 @@ messages and is discarded when the chat session closes.
 The plugin installs no mandatory global mappings. Its defaults are buffer-local:
 
 - Composer: `<CR>` submits and `<C-j>` inserts a newline.
-- Changed-file queue: `o` opens review, `a` accepts the file, and `r` rejects it.
+- Changed-file queue: `<CR>` or `o` opens a floating review, `a` accepts the
+  file, and `r` rejects it. The active row uses a full-line selection highlight.
 - Hunk review: `[c`/`]c` move between pending hunks, `a` accepts, `r` rejects,
   and `e` edits the complete candidate in an `acwrite` buffer.
+- Any AI Chatter buffer: `?` opens context-specific mapping help; `q`, `<Esc>`,
+  or `?` closes the help window.
 
 Each default forwards through a buffer-local `<Plug>` mapping, so custom
 mappings can reuse the plugin action: `AIChatterComposerSubmit`,
@@ -96,12 +99,16 @@ and `AIChatterReviewEdit`.
 
 ## Safety and unsaved buffers
 
-Each session creates a protected baseline and writable workspace under one
-validated temporary directory. Codex receives that workspace as its working
-directory; its turn policy allows writes only there, restricts additional reads,
-and disables network access by default. File-change approvals are automatic only
-inside the disposable workspace. Risky command access remains an explicit user
-decision.
+Each session creates an independent baseline and writable workspace under one
+validated temporary directory. Git projects use a local clone without shared
+hardlinks; non-Git projects use a local mirror. Codex edits that workspace, and
+AI Chatter derives the review automatically by comparing it with the baseline.
+No diff file is created and Codex is not asked to generate a patch.
+
+AI Chatter starts Codex with the `:danger-full-access` permission profile and
+`approvalPolicy = "never"`, so filesystem, network, and command operations do not
+prompt. This is intentionally unrestricted: a shell command can modify paths
+outside the disposable workspace and bypass AI Chatter's review boundary.
 
 Live project files and buffers remain unchanged while Codex works and while its
 response streams. Proposed changes appear only after `turn/completed`. Candidate

@@ -28,6 +28,17 @@ local function configure_window(winid)
   vim.wo[winid].number = false
   vim.wo[winid].relativenumber = false
   vim.wo[winid].signcolumn = "no"
+  vim.wo[winid].statuscolumn = ""
+  vim.wo[winid].foldcolumn = "0"
+end
+
+local function configure_changes_window(winid)
+  configure_window(winid)
+  vim.wo[winid].cursorline = true
+  vim.wo[winid].cursorlineopt = "line"
+  local highlights = vim.wo[winid].winhighlight
+  if highlights ~= "" then highlights = highlights .. "," end
+  vim.wo[winid].winhighlight = highlights .. "CursorLine:PmenuSel"
 end
 
 local function split_with_buffer(command, bufnr, split)
@@ -85,6 +96,7 @@ function Layout:show_changes(line_count)
   local current = vim.api.nvim_get_current_win()
   vim.api.nvim_set_current_win(self.transcript_win)
   self.changes_win = split_with_buffer("belowright split", self.changes_bufnr, self.split)
+  configure_changes_window(self.changes_win)
   vim.wo[self.changes_win].winfixheight = true
   self.change_lines = math.max(1, line_count or self.change_lines)
   self:resize()
@@ -145,6 +157,7 @@ function M.open(opts)
       "rightbelow vsplit", self.transcript_bufnr, self.split)
     self.changes_win = split_with_buffer(
       "belowright split", self.changes_bufnr, self.split)
+    configure_changes_window(self.changes_win)
     self.composer_win = split_with_buffer(
       "belowright split", self.composer_bufnr, self.split)
     vim.wo[self.changes_win].winfixheight = true

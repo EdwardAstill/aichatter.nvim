@@ -47,6 +47,37 @@ h.test("keyboard and mouse dispatch through the same row actions", function()
   view:close()
 end)
 
+h.test("Enter opens the selected changed file", function()
+  local opened
+  local view = require("aichatter.ui.changes").new({
+    on_open = function(file) opened = file.path end,
+  })
+  view:render({ one_file() })
+
+  h.invoke_mapping(view.bufnr, "n", "<CR>")
+
+  h.eq("lua/main.lua", opened)
+  view:close()
+end)
+
+h.test("question mark opens changed-file help and q closes it", function()
+  local view = require("aichatter.ui.changes").new({})
+  vim.api.nvim_set_current_buf(view.bufnr)
+  h.truthy(vim.fn.maparg("?", "n", false, true).callback ~= nil)
+
+  h.invoke_mapping(view.bufnr, "n", "?")
+
+  local help_buf = vim.api.nvim_get_current_buf()
+  local help_win = vim.api.nvim_get_current_win()
+  h.eq("aichatter-help", vim.bo[help_buf].filetype)
+  h.eq("editor", vim.api.nvim_win_get_config(help_win).relative)
+  h.matches("Accept file", h.buffer_text(help_buf))
+  h.matches("Reject file", h.buffer_text(help_buf))
+  h.invoke_mapping(help_buf, "n", "q")
+  h.falsy(vim.api.nvim_win_is_valid(help_win))
+  view:close()
+end)
+
 h.test("maps queue defaults through documented plug mappings", function()
   local view = require("aichatter.ui.changes").new({})
   vim.api.nvim_set_current_buf(view.bufnr)
@@ -54,6 +85,7 @@ h.test("maps queue defaults through documented plug mappings", function()
   h.eq("<Plug>(AIChatterChangesOpen)", vim.fn.maparg("o", "n", false, true).rhs)
   h.eq("<Plug>(AIChatterChangesAccept)", vim.fn.maparg("a", "n", false, true).rhs)
   h.eq("<Plug>(AIChatterChangesReject)", vim.fn.maparg("r", "n", false, true).rhs)
+  h.eq("<Plug>(AIChatterChangesOpen)", vim.fn.maparg("<CR>", "n", false, true).rhs)
   h.truthy(vim.fn.maparg("<Plug>(AIChatterChangesOpen)", "n", false, true).callback ~= nil)
   h.truthy(vim.fn.maparg("<Plug>(AIChatterChangesAccept)", "n", false, true).callback ~= nil)
   h.truthy(vim.fn.maparg("<Plug>(AIChatterChangesReject)", "n", false, true).callback ~= nil)

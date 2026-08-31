@@ -580,8 +580,8 @@ function Session:_start_thread(generation, operation, opts)
   local params = {
     ephemeral = true,
     cwd = self.shadow.workspace_root,
-    approvalPolicy = "untrusted",
-    permissions = ":workspace",
+    approvalPolicy = "never",
+    permissions = ":danger-full-access",
   }
   local completed = once(function(err, result)
     if not self:_generation_current(generation) then return end

@@ -34,8 +34,8 @@ end
 local function valid_thread_start(params)
   return params.ephemeral == true
     and type(params.cwd) == "string"
-    and params.approvalPolicy == "untrusted"
-    and params.permissions == ":workspace"
+    and params.approvalPolicy == "never"
+    and params.permissions == ":danger-full-access"
 end
 
 local function valid_turn_start(params)

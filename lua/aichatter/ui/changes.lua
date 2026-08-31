@@ -1,5 +1,6 @@
 local Changes = {}
 Changes.__index = Changes
+local Help = require("aichatter.ui.help")
 
 local function counts(file)
   if file.additions ~= nil or file.deletions ~= nil then
@@ -161,12 +162,20 @@ function M.new(opts)
     { buffer = bufnr, silent = true })
   vim.keymap.set("n", mappings.open, "<Plug>(AIChatterChangesOpen)",
     { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("n", "<CR>", "<Plug>(AIChatterChangesOpen)",
+    { buffer = bufnr, silent = true, remap = true })
   vim.keymap.set("n", mappings.accept, "<Plug>(AIChatterChangesAccept)",
     { buffer = bufnr, silent = true, remap = true })
   vim.keymap.set("n", mappings.reject, "<Plug>(AIChatterChangesReject)",
     { buffer = bufnr, silent = true, remap = true })
   vim.keymap.set("n", "<LeftMouse>", function() self:_mouse_action() end,
     { buffer = bufnr, silent = true })
+  Help.map(bufnr, "Changed Files", {
+    "<CR> / " .. mappings.open .. "  Open floating review",
+    mappings.accept .. "         Accept file",
+    mappings.reject .. "         Reject file",
+    "?         Show this help",
+  })
   return self
 end
 
