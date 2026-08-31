@@ -62,17 +62,46 @@ local function state_error(message)
   return { code = "invalid_state", message = message }
 end
 
+local function normalized_error_text(value)
+  return " " .. string.lower(value):gsub("[^%w_%-]+", " ") .. " "
+end
+
+local function has_error_phrase(value, phrase)
+  return normalized_error_text(value):find(" " .. phrase .. " ", 1, true) ~= nil
+end
+
+local function has_error_code(value, field)
+  local code = string.lower(value):gsub("[^%w]+", "_")
+    :gsub("^_+", ""):gsub("_+$", "")
+  for _, relationship in ipairs({
+    "unsupported", "unknown", "unrecognized", "unexpected", "invalid",
+  }) do
+    if code == relationship .. "_" .. field then return true end
+    for _, subject in ipairs({ "field", "parameter", "property" }) do
+      if code == relationship .. "_" .. subject .. "_" .. field then return true end
+    end
+  end
+  for _, subject in ipairs({ "field", "parameter", "property" }) do
+    if code == "not_supported_" .. subject .. "_" .. field then return true end
+  end
+  return false
+end
+
 local function unsupported_v2(err)
   if type(err) ~= "table" or type(err.message) ~= "string" then return false end
-  local message = string.lower(err.message):gsub("[^%w]+", " ")
   for _, field in ipairs({ "ephemeral", "readonlyaccess" }) do
+    if type(err.code) == "string" and has_error_code(err.code, field) then return true end
     for _, phrase in ipairs({
       "unsupported " .. field,
       "unsupported field " .. field,
       "unsupported parameter " .. field,
       "unsupported property " .. field,
+      "invalid field " .. field,
+      "invalid parameter " .. field,
+      "invalid property " .. field,
       field .. " is unsupported",
       field .. " is not supported",
+      field .. " is invalid",
       field .. " field is unsupported",
       field .. " field is not supported",
       "field " .. field .. " is unsupported",
@@ -85,7 +114,7 @@ local function unsupported_v2(err)
       "unexpected field " .. field,
       "unexpected parameter " .. field,
     }) do
-      if message:find(phrase, 1, true) then return true end
+      if has_error_phrase(err.message, phrase) then return true end
     end
   end
   return false
@@ -141,6 +170,7 @@ function Session.new(deps)
     _assistant_entry = nil,
     _pending_turn = nil,
     _expected_exit = false,
+    _settling = false,
   }, Session)
   self:_register_handlers()
   return self
@@ -196,14 +226,28 @@ function Session:_generation_current(generation)
   return not self.disposed and generation == self.generation
 end
 
-function Session:_invalidate_operations(err)
+function Session:_reject_reentry(callback)
+  if not self._settling then return false end
+  callback(state_error("session lifecycle transition in progress"))
+  return true
+end
+
+function Session:_invalidate_operations()
   self.generation = self.generation + 1
   self._sending = false
   self._pending_turn = nil
   local pending = {}
-  for operation in pairs(self.operations) do pending[#pending + 1] = operation end
+  for operation in pairs(self.operations) do
+    pending[#pending + 1] = operation
+    self.operations[operation] = nil
+  end
+  return pending
+end
+
+function Session:_settle_operations(pending, err)
+  err = error_value(err)
   for _, operation in ipairs(pending) do
-    self:_finish_operation(operation, error_value(err))
+    self:_finish_operation(operation, err)
   end
 end
 
@@ -498,8 +542,9 @@ function Session:_on_exit(result)
     code = result and result.code,
     signal = result and result.signal,
   }
+  self._settling = true
+  local pending = self:_invalidate_operations()
   self:_retire_commands("failed", nil, false)
-  self:_invalidate_operations(err)
   self.turn_id = nil
   self.thread_id = nil
   self._assistant_entry = nil
@@ -507,10 +552,20 @@ function Session:_on_exit(result)
     self:_transition("failed")
   end
   self:_record_error(err)
-  if self.restart_attempted or self.state ~= "failed" then return end
-  self.restart_attempted = true
-  self:_transition("starting")
-  self:_emit("restart", { attempt = 1 })
+  local restarting = not self.restart_attempted and not self.disposed
+    and self.state == "failed"
+  if restarting then
+    self.restart_attempted = true
+    self:_transition("starting")
+    if not self.disposed and self.state == "starting" then
+      self:_emit("restart", { attempt = 1 })
+    else
+      restarting = false
+    end
+  end
+  self:_settle_operations(pending, err)
+  self._settling = false
+  if not restarting or self.disposed or self.state ~= "starting" then return end
   local target = previous_state == "reviewable" and "reviewable" or "idle"
   self:_start_transport(self.generation, nil, {
     recovery = true,
@@ -521,6 +576,7 @@ end
 
 function Session:start(callback)
   callback = public_callback(callback)
+  if self:_reject_reentry(callback) then return end
   if self.disposed then
     callback(state_error("session is disposed and cannot be reopened"))
     return
@@ -530,7 +586,14 @@ function Session:start(callback)
     return
   end
   if self.state == "failed" then
-    self:_invalidate_operations({ message = "session retrying" })
+    self._settling = true
+    local pending = self:_invalidate_operations()
+    self:_settle_operations(pending, { message = "session retrying" })
+    self._settling = false
+    if self.disposed or self.state ~= "failed" then
+      callback(state_error("session cannot retry after a lifecycle transition"))
+      return
+    end
     local operation = self:_new_operation(callback)
     local generation = self.generation
     self.restart_attempted = false
@@ -554,6 +617,7 @@ end
 
 function Session:login(callback)
   callback = public_callback(callback)
+  if self:_reject_reentry(callback) then return end
   if self.disposed then
     callback(state_error("session is disposed"))
     return
@@ -592,6 +656,7 @@ end
 
 function Session:send(text, callback)
   callback = public_callback(callback)
+  if self:_reject_reentry(callback) then return end
   if self.disposed then callback(state_error("session is disposed")); return end
   if (self.state ~= "idle" and self.state ~= "reviewable") or self._sending then
     callback(state_error("send requires an idle or reviewable session"))
@@ -662,6 +727,7 @@ end
 
 function Session:steer(text, callback)
   callback = public_callback(callback)
+  if self:_reject_reentry(callback) then return end
   if self.disposed then callback(state_error("session is disposed")); return end
   if self.state ~= "running" or not self.turn_id then
     callback(state_error("steer requires an active turn"))
@@ -686,6 +752,9 @@ function Session:steer(text, callback)
 end
 
 function Session:approve_command(request_id, decision)
+  if self._settling or self.disposed then
+    return false, state_error("session lifecycle transition in progress")
+  end
   local pending = self.pending_commands[request_id]
   if not pending then return false, { message = "unknown command approval request" } end
   if type(decision) ~= "string" or decision == "" then
@@ -703,6 +772,7 @@ end
 
 function Session:cancel(callback)
   callback = public_callback(callback)
+  if self:_reject_reentry(callback) then return end
   if self.disposed then callback(state_error("session is disposed")); return end
   if (self.state ~= "running" and self.state ~= "waiting_for_command_approval")
     or not self.turn_id then
@@ -735,10 +805,10 @@ function Session:close(callback)
   if self.disposed then callback(); return end
   self._close_callbacks = { callback }
   local active_turn = self.turn_id
-  self:_retire_commands("cancelled", "cancel", true)
-  self:_invalidate_operations({ message = "session closing" })
-  self:_transition("closing")
   self.disposed = true
+  local pending = self:_invalidate_operations()
+  self:_transition("closing")
+  self:_retire_commands("cancelled", "cancel", true)
   self:_unregister_handlers()
   self.turn_id = nil
   self._assistant_entry = nil
@@ -748,6 +818,7 @@ function Session:close(callback)
       turnId = active_turn,
     }, noop)
   end
+  self:_settle_operations(pending, { message = "session closing" })
   local remaining = 2
   local first_error
   local function finished(err)

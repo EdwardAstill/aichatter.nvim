@@ -541,6 +541,85 @@ h.test("close settles a send before a delayed live sync returns", function()
   h.eq(0, #requests(fixture.transport, "turn/start"))
 end)
 
+h.test("close rejects reentrant work and joins a reentrant close once", function()
+  local sync_callback
+  local review = {
+    refresh = function(_, callback) callback() end,
+    files = function() return {} end,
+    sync_live = function(_, callback) sync_callback = callback end,
+  }
+  local fixture = h.session_fixture({ review = review, files = {} })
+  local cleanup_count = 0
+  fixture.session.shadow.cleanup = function(_, callback)
+    cleanup_count = cleanup_count + 1
+    callback()
+  end
+  local send_calls, reentrant_send_calls = 0, 0
+  local joined_close_calls, outer_close_calls = 0, 0
+  fixture.session:send("Wait", function(err)
+    h.matches("clos", err.message)
+    send_calls = send_calls + 1
+    fixture.session:close(function(close_err)
+      h.eq(nil, close_err)
+      joined_close_calls = joined_close_calls + 1
+    end)
+    fixture.session:send("Re-enter", function(reentrant_err)
+      h.truthy(reentrant_err)
+      reentrant_send_calls = reentrant_send_calls + 1
+    end)
+  end)
+
+  local ok = pcall(function()
+    fixture.session:close(function(err)
+      h.eq(nil, err)
+      outer_close_calls = outer_close_calls + 1
+    end)
+  end)
+
+  h.truthy(ok)
+  h.eq(1, send_calls)
+  h.eq(1, reentrant_send_calls)
+  h.eq(1, joined_close_calls)
+  h.eq(1, outer_close_calls)
+  h.eq(1, fixture.transport.stops)
+  h.eq(1, cleanup_count)
+  h.eq("closed", fixture.session.state)
+  sync_callback()
+  h.eq(1, send_calls)
+  h.eq(1, reentrant_send_calls)
+end)
+
+h.test("exit rejects callback re-entry before beginning recovery", function()
+  local sync_callbacks = {}
+  local review = {
+    refresh = function(_, callback) callback() end,
+    files = function() return {} end,
+    sync_live = function(_, callback)
+      sync_callbacks[#sync_callbacks + 1] = callback
+    end,
+  }
+  local fixture = h.session_fixture({ review = review, files = {} })
+  local send_calls, reentrant_calls = 0, 0
+  fixture.session:send("Wait", function(err)
+    h.matches("exit", err.message)
+    send_calls = send_calls + 1
+    fixture.session:send("Re-enter", function(reentrant_err)
+      h.truthy(reentrant_err)
+      reentrant_calls = reentrant_calls + 1
+    end)
+  end)
+
+  fixture.transport:emit("exit", { code = 23 })
+
+  h.eq(1, send_calls)
+  h.eq(1, reentrant_calls)
+  h.eq(1, #sync_callbacks)
+  h.eq("idle", fixture.session.state)
+  h.eq(1, fixture.transport.starts)
+  sync_callbacks[1]()
+  h.eq(0, #requests(fixture.transport, "turn/start"))
+end)
+
 h.test("ignores a delayed review refresh after exit recovery", function()
   local refresh_callback
   local review = {
@@ -814,6 +893,46 @@ h.test("requires an unsupported phrase to name the restricted v2 field", functio
   fixture.session:send("Try", function(err) captured = err end)
 
   h.eq(original.message, captured.message)
+end)
+
+h.test("requires exact restricted v2 identifiers in structured errors", function()
+  for _, original in ipairs({
+    { code = -32602, message = "unknown field ephemeralMode" },
+    { code = -32602, message = "unknown field ephemeral_mode" },
+    { code = -32602, message = "unsupported readOnlyAccessV2" },
+    { code = -32602, message = "unsupported readOnlyAccess-v2" },
+    { code = "unknown_field_ephemeralMode", message = "request rejected" },
+  }) do
+    local fixture = h.session_fixture({
+      responses = {
+        ["turn/start"] = function(_, callback) callback(original) end,
+      },
+    })
+    local captured
+
+    fixture.session:send("Try", function(err) captured = err end)
+
+    h.eq(original.message, captured.message)
+  end
+end)
+
+h.test("recognizes direct invalid and unsupported v2 identifiers", function()
+  for _, original in ipairs({
+    { code = "invalid_parameter_ephemeral", message = "invalid params" },
+    { code = -32602, message = "`readOnlyAccess` is not supported" },
+  }) do
+    local fixture = h.session_fixture({
+      responses = {
+        ["turn/start"] = function(_, callback) callback(original) end,
+      },
+    })
+    local captured
+
+    fixture.session:send("Try", function(err) captured = err end)
+
+    h.eq("Codex CLI is too old for aichatter.nvim; upgrade Codex and retry.",
+      captured.message)
+  end
 end)
 
 local function pending_command_fixture()
