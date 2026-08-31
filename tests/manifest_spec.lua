@@ -1,5 +1,19 @@
 local h = require("tests.helpers")
 local manifest = require("aichatter.manifest")
+local real_uv = vim.uv or vim.loop
+
+local function uv_with(overrides)
+  return setmetatable(overrides, { __index = real_uv })
+end
+
+local function scan_with(scanner, root)
+  local calls, failure, result = 0
+  scanner.scan(root, {}, function(err, value)
+    calls = calls + 1
+    failure, result = err, value
+  end)
+  return failure, result, calls
+end
 
 local function scan(root, opts)
   local result, failure
@@ -139,4 +153,194 @@ h.test("yields at the manifest batch boundary and cancels exactly once", functio
 
   h.eq(1, calls)
   h.eq("cancelled", callback_error.code)
+end)
+
+h.test("requests no-follow open semantics when libuv exposes them", function()
+  local root = h.tempdir()
+  h.write(root .. "/file", "safe")
+  local opened_flags
+  local isolated = manifest._new({
+    schedule = function(callback) callback() end,
+    uv = uv_with({
+      constants = { O_RDONLY = 0, O_NOFOLLOW = 131072 },
+      fs_open = function(path, flags, mode)
+        opened_flags = flags
+        return real_uv.fs_open(path, "r", mode)
+      end,
+    }),
+  })
+
+  local failure, entries, calls = scan_with(isolated, root)
+
+  h.eq(nil, failure)
+  h.eq(1, calls)
+  h.eq("file", entries.file.kind)
+  h.eq(131072, bit.band(opened_flags, 131072))
+end)
+
+h.test("rejects a file replaced by a symlink between lstat and open before reading", function()
+  local root = h.tempdir()
+  local outside = h.tempdir() .. "/outside"
+  local target = root .. "/file"
+  h.write(target, "inside")
+  h.write(outside, "outside")
+  local replaced = false
+  local reads = 0
+  local closes = 0
+  local isolated = manifest._new({
+    schedule = function(callback) callback() end,
+    uv = uv_with({
+      constants = {},
+      fs_lstat = function(path)
+        local stat, err, code = real_uv.fs_lstat(path)
+        if path == target and not replaced then
+          replaced = true
+          assert(real_uv.fs_unlink(path))
+          assert(real_uv.fs_symlink(outside, path))
+        end
+        return stat, err, code
+      end,
+      fs_read = function(...)
+        reads = reads + 1
+        return real_uv.fs_read(...)
+      end,
+      fs_close = function(...)
+        closes = closes + 1
+        return real_uv.fs_close(...)
+      end,
+    }),
+  })
+
+  local failure, entries, calls = scan_with(isolated, root)
+
+  h.eq(1, calls)
+  h.eq("changed", failure.code)
+  h.matches("changed while opening", failure.message)
+  h.eq(nil, entries)
+  h.eq(0, reads)
+  h.eq(1, closes)
+  h.eq("outside", h.read(outside))
+end)
+
+h.test("reports open failure without attempting to close a descriptor", function()
+  local root = h.tempdir()
+  h.write(root .. "/file", "content")
+  local closes = 0
+  local isolated = manifest._new({
+    schedule = function(callback) callback() end,
+    uv = uv_with({
+      fs_open = function()
+        return nil, "open denied", "EOPEN"
+      end,
+      fs_close = function(...)
+        closes = closes + 1
+        return real_uv.fs_close(...)
+      end,
+    }),
+  })
+
+  local failure, entries, calls = scan_with(isolated, root)
+
+  h.eq(1, calls)
+  h.eq("EOPEN", failure.code)
+  h.matches("open denied", failure.message)
+  h.eq(nil, entries)
+  h.eq(0, closes)
+end)
+
+h.test("closes the descriptor and reports a read failure exactly once", function()
+  local root = h.tempdir()
+  h.write(root .. "/file", "content")
+  local descriptors = {}
+  local closes = 0
+  local isolated = manifest._new({
+    schedule = function(callback) callback() end,
+    uv = uv_with({
+      fs_open = function(...)
+        local fd, err, code = real_uv.fs_open(...)
+        if fd then
+          descriptors[fd] = true
+        end
+        return fd, err, code
+      end,
+      fs_read = function()
+        return nil, "read failed", "EREAD"
+      end,
+      fs_close = function(fd)
+        closes = closes + 1
+        descriptors[fd] = nil
+        return real_uv.fs_close(fd)
+      end,
+    }),
+  })
+
+  local failure, entries, calls = scan_with(isolated, root)
+
+  h.eq(1, calls)
+  h.eq("EREAD", failure.code)
+  h.matches("read failed", failure.message)
+  h.eq(nil, entries)
+  h.eq(1, closes)
+  h.eq(nil, next(descriptors))
+end)
+
+h.test("closes the descriptor and reports close failure exactly once", function()
+  local root = h.tempdir()
+  h.write(root .. "/file", "content")
+  local descriptors = {}
+  local closes = 0
+  local isolated = manifest._new({
+    schedule = function(callback) callback() end,
+    uv = uv_with({
+      fs_open = function(...)
+        local fd, err, code = real_uv.fs_open(...)
+        if fd then
+          descriptors[fd] = true
+        end
+        return fd, err, code
+      end,
+      fs_close = function(fd)
+        closes = closes + 1
+        descriptors[fd] = nil
+        assert(real_uv.fs_close(fd))
+        return nil, "close failed", "ECLOSE"
+      end,
+    }),
+  })
+
+  local failure, entries, calls = scan_with(isolated, root)
+
+  h.eq(1, calls)
+  h.eq("ECLOSE", failure.code)
+  h.matches("close failed", failure.message)
+  h.eq(nil, entries)
+  h.eq(1, closes)
+  h.eq(nil, next(descriptors))
+end)
+
+h.test("preserves read failure precedence when closing also fails", function()
+  local root = h.tempdir()
+  h.write(root .. "/file", "content")
+  local closes = 0
+  local isolated = manifest._new({
+    schedule = function(callback) callback() end,
+    uv = uv_with({
+      fs_read = function()
+        return nil, "read failed first", "EREAD"
+      end,
+      fs_close = function(fd)
+        closes = closes + 1
+        assert(real_uv.fs_close(fd))
+        return nil, "close failed second", "ECLOSE"
+      end,
+    }),
+  })
+
+  local failure, entries, calls = scan_with(isolated, root)
+
+  h.eq(1, calls)
+  h.eq("EREAD", failure.code)
+  h.matches("read failed first", failure.message)
+  h.eq(nil, entries)
+  h.eq(1, closes)
 end)

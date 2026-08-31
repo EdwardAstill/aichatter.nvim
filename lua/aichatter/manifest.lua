@@ -24,14 +24,42 @@ local function new(dependencies)
     return value
   end
 
-  local function read_file(target, size)
-    local fd, open_err, open_code = uv.fs_open(target, "r", 0)
+  local function open_flags()
+    local constants = uv.constants or {}
+    if type(constants.O_RDONLY) == "number" and type(constants.O_NOFOLLOW) == "number" then
+      return bit.bor(constants.O_RDONLY, constants.O_NOFOLLOW)
+    end
+    return "r"
+  end
+
+  local function same_identity(before, after)
+    return after.type == "file"
+      and before.dev ~= nil
+      and before.ino ~= nil
+      and before.dev == after.dev
+      and before.ino == after.ino
+  end
+
+  local function read_file(target, stat)
+    local fd, open_err, open_code = uv.fs_open(target, open_flags(), 0)
     check(fd, open_err, open_code, "open", target)
     local chunks = {}
     local offset = 0
     local ok, result = xpcall(function()
-      while offset < size do
-        local bytes, read_err, read_code = uv.fs_read(fd, math.min(65536, size - offset), offset)
+      local opened, stat_err, stat_code = uv.fs_fstat(fd)
+      check(opened, stat_err, stat_code, "fstat", target)
+      if not same_identity(stat, opened) then
+        error({
+          code = "changed",
+          message = "file changed while opening " .. target,
+        }, 0)
+      end
+      while offset < opened.size do
+        local bytes, read_err, read_code = uv.fs_read(
+          fd,
+          math.min(65536, opened.size - offset),
+          offset
+        )
         check(bytes, read_err, read_code, "read", target)
         if bytes == "" then
           break
@@ -41,10 +69,11 @@ local function new(dependencies)
       end
       return table.concat(chunks)
     end, function(err) return err end)
-    uv.fs_close(fd)
+    local closed, close_err, close_code = uv.fs_close(fd)
     if not ok then
       error(result, 0)
     end
+    check(closed, close_err, close_code, "close", target)
     return result
   end
 
@@ -75,7 +104,7 @@ local function new(dependencies)
       check(target, link_err, link_code, "readlink", entry.absolute)
       job.entries[entry.relative] = { kind = "link", target = target }
     elseif stat.type == "file" then
-      local bytes = read_file(entry.absolute, stat.size)
+      local bytes = read_file(entry.absolute, stat)
       job.entries[entry.relative] = {
         kind = "file",
         size = #bytes,
