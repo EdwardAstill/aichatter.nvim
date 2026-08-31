@@ -126,6 +126,34 @@ local function copy_file_bytes(source, target, mode)
   end
 end
 
+local remove_entry
+
+local function destination_stat(target)
+  local stat, err, code = uv.fs_lstat(target)
+  if not stat and code ~= "ENOENT" then
+    check(stat, err, code, "lstat", target)
+  end
+  return stat
+end
+
+local function prepare_destination(job, target, wanted_type)
+  local stat = destination_stat(target)
+  if not stat then
+    return false
+  end
+  if not job.overlay then
+    failure("destination exists: " .. target, "EEXIST")
+  end
+  if wanted_type == "directory" and stat.type == "directory" then
+    return true
+  end
+  if wanted_type == "file" and stat.type == "file" then
+    return true
+  end
+  remove_entry(target)
+  return false
+end
+
 local function enqueue_children(job, source, target, relative)
   local scan, scan_err, scan_code = uv.fs_scandir(source)
   check(scan, scan_err, scan_code, "scan", source)
@@ -134,11 +162,13 @@ local function enqueue_children(job, source, target, relative)
     if not name then
       break
     end
-    if not job.exclude[name] then
+    local child_relative = relative == "" and name or relative .. "/" .. name
+    if not job.exclude[child_relative]
+      and not (name == ".git" and job.exclude[".git"]) then
       job.queue[#job.queue + 1] = {
         source = source .. "/" .. name,
         target = target .. "/" .. name,
-        relative = relative == "" and name or relative .. "/" .. name,
+        relative = child_relative,
       }
     end
   end
@@ -149,15 +179,20 @@ local function copy_entry(job, entry)
   check(stat, stat_err, stat_code, "lstat", entry.source)
 
   if stat.type == "directory" then
-    local made, mkdir_err, mkdir_code = uv.fs_mkdir(entry.target, permissions(stat.mode))
-    check(made, mkdir_err, mkdir_code, "mkdir", entry.target)
+    local exists = prepare_destination(job, entry.target, "directory")
+    if not exists then
+      local made, mkdir_err, mkdir_code = uv.fs_mkdir(entry.target, permissions(stat.mode))
+      check(made, mkdir_err, mkdir_code, "mkdir", entry.target)
+    end
     enqueue_children(job, entry.source, entry.target, entry.relative)
   elseif stat.type == "link" then
+    prepare_destination(job, entry.target, "link")
     local link, read_err, read_code = uv.fs_readlink(entry.source)
     check(link, read_err, read_code, "readlink", entry.source)
     local made, link_err, link_code = uv.fs_symlink(link, entry.target)
     check(made, link_err, link_code, "symlink", entry.target)
   elseif stat.type == "file" then
+    prepare_destination(job, entry.target, "file")
     copy_file_bytes(entry.source, entry.target, stat.mode)
   else
     failure("unsupported file type at " .. entry.source)
@@ -171,6 +206,7 @@ function M.copy_tree(source, target, opts, callback)
     callback = callback,
     cancel = opts.cancel or {},
     exclude = opts.exclude or {},
+    overlay = opts.overlay or false,
     on_progress = opts.on_progress,
     queue = { {
       source = path.normalize(source),
@@ -312,7 +348,7 @@ function M.atomic_write(target, bytes, mode, callback)
   end)
 end
 
-local function remove_entry(target)
+remove_entry = function(target)
   local stat, stat_err, stat_code = uv.fs_lstat(target)
   if not stat then
     if stat_code == "ENOENT" then

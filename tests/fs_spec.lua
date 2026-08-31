@@ -113,6 +113,38 @@ h.test("preserves executable file mode", function()
   h.eq(493, bit.band(uv.fs_stat(target .. "/run.sh").mode, 511))
 end)
 
+h.test("safely overlays an existing tree with exact relative exclusions", function()
+  local source = h.tempdir()
+  local target = h.tempdir() .. "/copy"
+  local outside = h.tempdir()
+  h.mkdir(source .. "/nested")
+  h.write(source .. "/nested/keep.txt", "new\n")
+  h.write(source .. "/nested/proposed.txt", "live proposal\n")
+  h.write(source .. "/replace-link", "safe replacement\n")
+  h.symlink("nested/keep.txt", source .. "/new-link")
+  h.mkdir(target .. "/nested")
+  h.write(target .. "/nested/keep.txt", "old\n")
+  h.write(target .. "/nested/proposed.txt", "shadow proposal\n")
+  h.write(target .. "/new-link", "old regular file\n")
+  h.write(outside .. "/untouched", "outside\n")
+  h.symlink(outside .. "/untouched", target .. "/replace-link")
+
+  local err = wait_for_callback(function(cb)
+    fs.copy_tree(source, target, {
+      overlay = true,
+      exclude = { ["nested/proposed.txt"] = true },
+    }, cb)
+  end)
+
+  h.eq(nil, err)
+  h.eq("new\n", h.read(target .. "/nested/keep.txt"))
+  h.eq("shadow proposal\n", h.read(target .. "/nested/proposed.txt"))
+  h.eq("safe replacement\n", h.read(target .. "/replace-link"))
+  h.eq("outside\n", h.read(outside .. "/untouched"))
+  h.eq("link", uv.fs_lstat(target .. "/new-link").type)
+  h.eq("nested/keep.txt", uv.fs_readlink(target .. "/new-link"))
+end)
+
 h.test("yields at the batch boundary and cancels with an exact partial tree", function()
   local source = h.tempdir()
   local target = h.tempdir() .. "/copy"

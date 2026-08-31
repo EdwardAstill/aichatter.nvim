@@ -64,6 +64,48 @@ function M.chmod(path, mode)
   assert(vim.uv.fs_chmod(path, mode))
 end
 
+local function git(root, ...)
+  local argv = { "git", "-C", root, ... }
+  local result = vim.system(argv, { text = true }):wait()
+  assert(result.code == 0, string.format(
+    "%s failed (%d): %s",
+    table.concat(argv, " "),
+    result.code,
+    result.stderr or ""
+  ))
+end
+
+function M.git_project(files)
+  local root = M.tempdir()
+  git(root, "init", "--quiet")
+  git(root, "config", "user.name", "aichatter tests")
+  git(root, "config", "user.email", "aichatter@example.invalid")
+  for relative, bytes in pairs(files or {}) do
+    local parent = vim.fs.dirname(root .. "/" .. relative)
+    M.mkdir(parent)
+    M.write(root .. "/" .. relative, bytes)
+  end
+  git(root, "add", "--all")
+  git(root, "commit", "--quiet", "-m", "fixture")
+  return root
+end
+
+function M.create_shadow(root, opts)
+  opts = vim.tbl_extend("force", {
+    root = root,
+    temp_parent = M.tempdir(),
+  }, opts or {})
+  local Shadow = require("aichatter.shadow")
+  local value, failure
+  Shadow.create(opts, function(err, result)
+    failure, value = err, result
+  end)
+  assert(M.wait_for(function() return failure ~= nil or value ~= nil end, 3000),
+    "timed out creating shadow workspace")
+  assert(not failure, vim.inspect(failure))
+  return value
+end
+
 function M.fake_transport(responses)
   local listeners = {}
   local transport = { responded = {} }
