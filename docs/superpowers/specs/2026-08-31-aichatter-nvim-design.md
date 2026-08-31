@@ -34,7 +34,7 @@ The plugin talks directly to `codex app-server` over JSONL/JSON-RPC. It has no N
 ## Dependencies
 
 - Neovim 0.10 or newer.
-- A `codex` executable with app-server v2 support and ephemeral root threads.
+- A `codex` executable with app-server v2 support for ephemeral root threads and restricted sandbox read access.
 - Git when the selected project is a Git repository.
 
 Project-language support is model-driven. The plugin treats project files generically and does not require language-specific adapters.
@@ -195,7 +195,7 @@ Accept All and Reject All iterate through still-pending hunks using the same val
 
 ## Error handling and shutdown
 
-- A missing or incompatible Codex executable leaves the panel open with an actionable diagnostic.
+- A missing Codex executable, or an app-server build without ephemeral-thread or restricted-read support, leaves the panel open with an actionable upgrade diagnostic.
 - Missing authentication produces the sign-in action rather than a failed turn.
 - A malformed protocol message fails its request or reports a notification error without invalidating unrelated pending requests.
 - An unexpected app-server exit fails the active turn and restarts the server at most once. The shadow workspace and review state remain intact.
