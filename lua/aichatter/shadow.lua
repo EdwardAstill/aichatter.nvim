@@ -86,6 +86,28 @@ local function new(dependencies)
     end
   end
 
+  local function real_project_root(target)
+    local real, err, code = uv.fs_realpath(target)
+    if not real then
+      return nil, {
+        code = code,
+        message = string.format("realpath %s: %s", target, err or "unknown error"),
+      }
+    end
+    real = path.normalize(real)
+    local stat, stat_err, stat_code = uv.fs_lstat(real)
+    if not stat then
+      return nil, {
+        code = stat_code,
+        message = string.format("lstat %s: %s", real, stat_err or "unknown error"),
+      }
+    end
+    if stat.type ~= "directory" then
+      return nil, { message = "project root is not a directory: " .. real }
+    end
+    return real
+  end
+
   local function create_session_root(temp_parent)
     for _ = 1, 100 do
       session_counter = session_counter + 1
@@ -96,10 +118,6 @@ local function new(dependencies)
       ))
       local err = mkdir(candidate)
       if not err then
-        local control_err = mkdir(candidate .. "/control")
-        if control_err then
-          return nil, control_err
-        end
         return candidate
       end
       if err.code ~= "EEXIST" then
@@ -125,8 +143,8 @@ local function new(dependencies)
     self._cancels[cancel] = true
     self._active = self._active + 1
     local complete = once(function(err)
-      callback(err)
       self:_finish_activity(cancel)
+      pcall(callback, err)
     end)
     local returned, thrown = pcall(fs.copy_tree, source, target, opts, complete)
     if not returned then
@@ -138,8 +156,8 @@ local function new(dependencies)
     callback = once(callback)
     self._active = self._active + 1
     local complete = once(function(err)
-      callback(err)
       self:_finish_activity()
+      pcall(callback, err)
     end)
     local returned, thrown = pcall(fs.atomic_write, target, bytes, mode, complete)
     if not returned then
@@ -210,6 +228,27 @@ local function new(dependencies)
         return nil, { message = "buffer outside project root: " .. buffer_path }
       end
       local relative = path.relative(self.project_root, buffer_path)
+      local current = self.project_root
+      local parent_relative = vim.fs.dirname(relative)
+      if parent_relative ~= "." then
+        for component in parent_relative:gmatch("[^/]+") do
+          current = current .. "/" .. component
+          local stat, stat_err, stat_code = uv.fs_lstat(current)
+          if not stat then
+            if stat_code == "ENOENT" then
+              break
+            end
+            return nil, {
+              code = stat_code,
+              message = string.format("lstat %s: %s", current, stat_err or "unknown error"),
+            }
+          elseif stat.type == "link" then
+            return nil, { message = "symlink ancestor in buffer path: " .. current }
+          elseif stat.type ~= "directory" then
+            return nil, { message = "non-directory ancestor in buffer path: " .. current }
+          end
+        end
+      end
       if not exclude[relative] then
         selected[#selected + 1] = {
           relative = relative,
@@ -295,6 +334,7 @@ local function new(dependencies)
     self:_copy(self.project_root, self.workspace_root, {
       exclude = exclude,
       overlay = true,
+      prune = true,
     }, function(workspace_err)
       if workspace_err then
         callback(workspace_err)
@@ -307,6 +347,7 @@ local function new(dependencies)
       self:_copy(self.project_root, self.baseline_root, {
         exclude = exclude,
         overlay = true,
+        prune = true,
       }, function(baseline_err)
         if baseline_err then
           callback(baseline_err)
@@ -328,7 +369,12 @@ local function new(dependencies)
   function Shadow.create(opts, callback)
     opts = opts or {}
     callback = once(callback or function() end)
-    local root = path.project_root(assert(opts.root, "root is required"))
+    local located_root = path.project_root(assert(opts.root, "root is required"))
+    local root, root_err = real_project_root(located_root)
+    if not root then
+      callback(root_err)
+      return
+    end
     local temp_parent = path.normalize(assert(opts.temp_parent, "temp_parent is required"))
     local session_root, session_err = create_session_root(temp_parent)
     if not session_root then
@@ -357,10 +403,17 @@ local function new(dependencies)
       end)
     end
 
+    local control_err = mkdir(session_root .. "/control")
+    if control_err then
+      fail(control_err)
+      return
+    end
+
     local function overlay_live_then_baseline()
       self:_copy(root, self.workspace_root, {
         exclude = { [".git"] = true },
         overlay = true,
+        prune = true,
       }, function(overlay_err)
         if overlay_err then
           fail(overlay_err)

@@ -80,14 +80,33 @@ local function ensure_directory(directory)
   end)
 end
 
+local function open_unique_sibling(target, mode)
+  for _ = 1, 10 do
+    atomic_counter = atomic_counter + 1
+    local temp = string.format("%s.aichatter-tmp-%d-%d", target, uv.os_getpid(), atomic_counter)
+    local fd, err, code = uv.fs_open(temp, "wx", permissions(mode))
+    if fd then
+      return temp, fd
+    end
+    if code ~= "EEXIST" then
+      check(fd, err, code, "open", temp)
+    end
+  end
+  failure("could not create a unique temporary sibling for " .. target)
+end
+
 local function copy_file_bytes(source, target, mode)
   local source_fd, open_err, open_code = uv.fs_open(source, "r", 0)
   check(source_fd, open_err, open_code, "open", source)
 
-  local target_fd, target_err, target_code = uv.fs_open(target, "w", permissions(mode))
-  if not target_fd then
+  local temp
+  local target_fd
+  local opened, open_failure = xpcall(function()
+    temp, target_fd = open_unique_sibling(target, mode)
+  end, identity)
+  if not opened then
     close_fd(source_fd)
-    check(target_fd, target_err, target_code, "open", target)
+    error(open_failure, 0)
   end
 
   local ok, err = xpcall(function()
@@ -114,14 +133,24 @@ local function copy_file_bytes(source, target, mode)
       end
       offset = offset + #bytes
     end
-    local changed, chmod_err, chmod_code = uv.fs_chmod(target, permissions(mode))
-    check(changed, chmod_err, chmod_code, "chmod", target)
+    local synced, sync_err, sync_code = uv.fs_fsync(target_fd)
+    check(synced, sync_err, sync_code, "fsync", temp)
+    local closed, close_err, close_code = uv.fs_close(target_fd)
+    check(closed, close_err, close_code, "close", temp)
+    target_fd = nil
+    local changed, chmod_err, chmod_code = uv.fs_chmod(temp, permissions(mode))
+    check(changed, chmod_err, chmod_code, "chmod", temp)
+    local renamed, rename_err, rename_code = uv.fs_rename(temp, target)
+    check(renamed, rename_err, rename_code, "rename", target)
+    temp = nil
   end, identity)
 
   close_fd(source_fd)
   close_fd(target_fd)
+  if temp then
+    uv.fs_unlink(temp)
+  end
   if not ok then
-    uv.fs_unlink(target)
     error(err, 0)
   end
 end
@@ -154,7 +183,51 @@ local function prepare_destination(job, target, wanted_type)
   return false
 end
 
+local function is_excluded(job, name, relative)
+  return job.exclude[relative] or (name == ".git" and job.exclude[".git"])
+end
+
+local function preserves_excluded_descendant(job, relative)
+  if job.exclude[relative] then
+    return true
+  end
+  local prefix = relative .. "/"
+  for excluded in pairs(job.exclude) do
+    if excluded:sub(1, #prefix) == prefix then
+      return true
+    end
+  end
+  return false
+end
+
+local function prune_missing_entry(job, target, name, relative)
+  if is_excluded(job, name, relative) then
+    return
+  end
+  if not preserves_excluded_descendant(job, relative) then
+    remove_entry(target)
+    return
+  end
+  local stat, stat_err, stat_code = uv.fs_lstat(target)
+  check(stat, stat_err, stat_code, "lstat", target)
+  if stat.type ~= "directory" then
+    remove_entry(target)
+    return
+  end
+  local scan, scan_err, scan_code = uv.fs_scandir(target)
+  check(scan, scan_err, scan_code, "scan", target)
+  while true do
+    local child_name = uv.fs_scandir_next(scan)
+    if not child_name then
+      break
+    end
+    local child_relative = relative .. "/" .. child_name
+    prune_missing_entry(job, target .. "/" .. child_name, child_name, child_relative)
+  end
+end
+
 local function enqueue_children(job, source, target, relative)
+  local source_names = {}
   local scan, scan_err, scan_code = uv.fs_scandir(source)
   check(scan, scan_err, scan_code, "scan", source)
   while true do
@@ -162,14 +235,29 @@ local function enqueue_children(job, source, target, relative)
     if not name then
       break
     end
+    source_names[name] = true
     local child_relative = relative == "" and name or relative .. "/" .. name
-    if not job.exclude[child_relative]
-      and not (name == ".git" and job.exclude[".git"]) then
+    if not is_excluded(job, name, child_relative) then
       job.queue[#job.queue + 1] = {
         source = source .. "/" .. name,
         target = target .. "/" .. name,
         relative = child_relative,
       }
+    end
+  end
+
+  if job.prune then
+    local target_scan, target_err, target_code = uv.fs_scandir(target)
+    check(target_scan, target_err, target_code, "scan", target)
+    while true do
+      local name = uv.fs_scandir_next(target_scan)
+      if not name then
+        break
+      end
+      local child_relative = relative == "" and name or relative .. "/" .. name
+      if not source_names[name] then
+        prune_missing_entry(job, target .. "/" .. name, name, child_relative)
+      end
     end
   end
 end
@@ -207,6 +295,7 @@ function M.copy_tree(source, target, opts, callback)
     cancel = opts.cancel or {},
     exclude = opts.exclude or {},
     overlay = opts.overlay or false,
+    prune = opts.prune or false,
     on_progress = opts.on_progress,
     queue = { {
       source = path.normalize(source),
@@ -307,21 +396,8 @@ function M.atomic_write(target, bytes, mode, callback)
     local temp
     local fd
     local ok, err = xpcall(function()
-      for _ = 1, 10 do
-        atomic_counter = atomic_counter + 1
-        temp = string.format("%s.aichatter-tmp-%d-%d", target, uv.os_getpid(), atomic_counter)
-        local open_err, open_code
-        fd, open_err, open_code = uv.fs_open(temp, "wx", permissions(mode))
-        if fd then
-          break
-        end
-        if open_code ~= "EEXIST" then
-          check(fd, open_err, open_code, "open", temp)
-        end
-      end
-      if not fd then
-        failure("could not create a unique temporary sibling for " .. target)
-      end
+      ensure_directory(vim.fs.dirname(target))
+      temp, fd = open_unique_sibling(target, mode)
 
       write_all(fd, temp, bytes)
       local synced, sync_err, sync_code = uv.fs_fsync(fd)

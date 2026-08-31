@@ -145,6 +145,28 @@ h.test("safely overlays an existing tree with exact relative exclusions", functi
   h.eq("nested/keep.txt", uv.fs_readlink(target .. "/new-link"))
 end)
 
+h.test("overlay replaces a hardlinked destination without mutating its peer", function()
+  local source = h.tempdir()
+  local target = h.tempdir() .. "/copy"
+  local protected = h.tempdir() .. "/protected.txt"
+  h.write(source .. "/state.txt", "fresh\n")
+  h.write(protected, "protected\n")
+  h.mkdir(target)
+  assert(uv.fs_link(protected, target .. "/state.txt"))
+  local protected_inode = uv.fs_stat(protected).ino
+  h.eq(protected_inode, uv.fs_stat(target .. "/state.txt").ino)
+
+  local err = wait_for_callback(function(cb)
+    fs.copy_tree(source, target, { overlay = true }, cb)
+  end)
+
+  h.eq(nil, err)
+  h.eq("fresh\n", h.read(target .. "/state.txt"))
+  h.eq("protected\n", h.read(protected))
+  h.eq(protected_inode, uv.fs_stat(protected).ino)
+  h.falsy(protected_inode == uv.fs_stat(target .. "/state.txt").ino)
+end)
+
 h.test("yields at the batch boundary and cancels with an exact partial tree", function()
   local source = h.tempdir()
   local target = h.tempdir() .. "/copy"

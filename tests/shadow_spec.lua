@@ -4,6 +4,10 @@ local Shadow = require("aichatter.shadow")
 
 local uv = vim.uv
 
+local function uv_with(overrides)
+  return setmetatable(overrides or {}, { __index = uv })
+end
+
 local function wait_result(start)
   local calls, failure, value = 0
   start(function(err, result)
@@ -120,6 +124,46 @@ h.test("preserves symlinks in workspace and metadata-free baseline", function()
   end
 end)
 
+h.test("rejects buffer paths through symlink ancestors without changing external bytes", function()
+  local root = h.tempdir()
+  local outside = h.tempdir()
+  h.write(outside .. "/victim.txt", "external\n")
+  h.symlink(outside, root .. "/linked")
+
+  local err, shadow = wait_result(function(callback)
+    Shadow.create({
+      root = root,
+      temp_parent = h.tempdir(),
+      buffer_provider = function()
+        return {
+          { path = root .. "/linked/victim.txt", bytes = "overwritten\n", mode = 420 },
+        }
+      end,
+    }, callback)
+  end)
+
+  h.truthy(err)
+  h.eq(nil, shadow)
+  h.matches("symlink ancestor", err.message)
+  h.eq("external\n", h.read(outside .. "/victim.txt"))
+end)
+
+h.test("resolves a symlinked project root before mirroring", function()
+  local parent = h.tempdir()
+  local actual = parent .. "/actual"
+  local linked = parent .. "/linked-root"
+  h.mkdir(actual)
+  h.write(actual .. "/main.lua", "return 1\n")
+  h.symlink(actual, linked)
+
+  local shadow = h.create_shadow(linked)
+
+  h.eq(actual, shadow.project_root)
+  h.eq("directory", uv.fs_lstat(shadow.workspace_root).type)
+  h.eq("directory", uv.fs_lstat(shadow.baseline_root).type)
+  h.eq("return 1\n", h.read(shadow.workspace_root .. "/main.lua"))
+end)
+
 h.test("sync_live updates both trees while retaining excluded proposals", function()
   local root = h.tempdir()
   h.write(root .. "/proposal.txt", "shadow proposal\n")
@@ -138,6 +182,43 @@ h.test("sync_live updates both trees while retaining excluded proposals", functi
     h.eq("fresh\n", h.read(destination .. "/ordinary.txt"))
   end
   h.eq("live proposal\n", h.read(root .. "/proposal.txt"))
+end)
+
+h.test("sync_live prunes deleted files directories and symlinks but retains exclusions", function()
+  local root = h.git_project({
+    ["deleted-file.txt"] = "file\n",
+    ["deleted-dir/child.txt"] = "child\n",
+    ["keep.txt"] = "keep\n",
+    ["proposal.txt"] = "proposal\n",
+    ["proposal-dir/child.txt"] = "nested proposal\n",
+    ["proposal-dir/remove.txt"] = "remove me\n",
+  })
+  h.symlink("keep.txt", root .. "/deleted-link")
+  local shadow = h.create_shadow(root)
+  vim.fn.delete(root .. "/deleted-file.txt")
+  vim.fn.delete(root .. "/deleted-dir", "rf")
+  vim.fn.delete(root .. "/deleted-link")
+  vim.fn.delete(root .. "/proposal.txt")
+  vim.fn.delete(root .. "/proposal-dir", "rf")
+
+  local err = wait_error(function(callback)
+    shadow:sync_live({
+      ["proposal.txt"] = true,
+      ["proposal-dir/child.txt"] = true,
+    }, callback)
+  end)
+
+  h.eq(nil, err)
+  for _, destination in ipairs({ shadow.workspace_root, shadow.baseline_root }) do
+    h.eq(nil, uv.fs_lstat(destination .. "/deleted-file.txt"))
+    h.eq(nil, uv.fs_lstat(destination .. "/deleted-dir"))
+    h.eq(nil, uv.fs_lstat(destination .. "/deleted-link"))
+    h.eq("proposal\n", h.read(destination .. "/proposal.txt"))
+    h.eq("nested proposal\n", h.read(destination .. "/proposal-dir/child.txt"))
+    h.eq(nil, uv.fs_lstat(destination .. "/proposal-dir/remove.txt"))
+  end
+  h.truthy(uv.fs_lstat(shadow.workspace_root .. "/.git"))
+  h.eq(nil, uv.fs_lstat(shadow.baseline_root .. "/.git"))
 end)
 
 h.test("returns structured argv exit and stderr on clone failure", function()
@@ -162,6 +243,32 @@ h.test("returns structured argv exit and stderr on clone failure", function()
   h.eq("clone exploded\n", err.stderr)
   h.eq(vim.inspect(clone_argv), vim.inspect(err.argv))
   h.matches("git clone failed", err.message)
+end)
+
+h.test("cleans a partially allocated session when control directory creation fails", function()
+  local temp_parent = h.tempdir()
+  local mkdir_calls = 0
+  local session_root
+  local Isolated = Shadow._new({
+    uv = uv_with({
+      fs_mkdir = function(target, mode)
+        mkdir_calls = mkdir_calls + 1
+        if mkdir_calls == 1 then
+          session_root = target
+          return uv.fs_mkdir(target, mode)
+        end
+        return nil, "injected control failure", "EIO"
+      end,
+    }),
+  })
+
+  local err = wait_error(function(callback)
+    Isolated.create({ root = h.tempdir(), temp_parent = temp_parent }, callback)
+  end)
+
+  h.eq("EIO", err.code)
+  h.matches("injected control failure", err.message)
+  h.eq(nil, uv.fs_lstat(session_root))
 end)
 
 h.test("cleanup cancels outstanding sync and removes the session exactly once", function()
@@ -213,4 +320,54 @@ h.test("cleanup cancels outstanding sync and removes the session exactly once", 
   shadow:cleanup(function() cleanup_calls = cleanup_calls + 1 end)
   h.eq(1, remove_calls)
   h.eq(3, cleanup_calls)
+end)
+
+local function fake_shadow(buffer_provider)
+  local remove_calls = 0
+  local fake_fs = {
+    copy_tree = function(_, _, _, callback) callback() end,
+    atomic_write = function(_, _, _, callback) callback() end,
+    remove_tree_guarded = function(_, _, callback)
+      remove_calls = remove_calls + 1
+      callback()
+    end,
+  }
+  local Isolated = Shadow._new({ fs = fake_fs })
+  local err, shadow = wait_result(function(callback)
+    Isolated.create({
+      root = h.tempdir(),
+      temp_parent = h.tempdir(),
+      run = function(_, done) done(nil, { code = 1, stderr = "not git" }) end,
+      buffer_provider = buffer_provider or function() return {} end,
+    }, callback)
+  end)
+  h.eq(nil, err)
+  return shadow, function() return remove_calls end
+end
+
+h.test("throwing sync callback cannot strand cleanup activity", function()
+  local shadow, remove_calls = fake_shadow()
+
+  shadow:sync_live({}, function() error("injected sync callback failure") end)
+  shadow:cleanup()
+
+  h.eq(1, remove_calls())
+end)
+
+h.test("throwing buffer callback cannot strand cleanup activity", function()
+  local enabled = false
+  local root
+  local shadow, remove_calls = fake_shadow(function()
+    if not enabled then
+      return {}
+    end
+    return { { path = root .. "/new.txt", bytes = "buffer\n", mode = 420 } }
+  end)
+  root = shadow.project_root
+  enabled = true
+
+  shadow:overlay_buffers(function() error("injected buffer callback failure") end)
+  shadow:cleanup()
+
+  h.eq(1, remove_calls())
 end)
