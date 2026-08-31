@@ -131,3 +131,42 @@ h.test("emits an exit event when the app server ends", function()
   h.eq(23, exited.code)
   h.eq(0, exited.signal)
 end)
+
+h.test("can initialize a fresh process after an unexpected exit", function()
+  local launches = {}
+  local transport = Transport.new({
+    launcher = function(_, opts, on_exit)
+      local process = {
+        is_closing = function() return false end,
+        write = function(_, value)
+          launches[#launches].writes[#launches[#launches].writes + 1] = value
+        end,
+      }
+      launches[#launches + 1] = {
+        opts = opts,
+        on_exit = on_exit,
+        process = process,
+        writes = {},
+      }
+      return process
+    end,
+    scheduler = function(callback) callback() end,
+  })
+  local starts = 0
+
+  transport:start(function(err)
+    h.eq(nil, err)
+    starts = starts + 1
+  end)
+  launches[1].opts.stdout(nil, '{"id":1,"result":{}}\n')
+  launches[1].on_exit({ code = 23, signal = 0 })
+  transport:start(function(err)
+    h.eq(nil, err)
+    starts = starts + 1
+  end)
+
+  h.eq(2, #launches)
+  h.eq("initialize", vim.json.decode(launches[2].writes[1]).method)
+  launches[2].opts.stdout(nil, '{"id":2,"result":{}}\n')
+  h.eq(2, starts)
+end)

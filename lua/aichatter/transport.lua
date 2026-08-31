@@ -19,15 +19,20 @@ function Transport.new(opts)
     launcher = opts.launcher or vim.system,
     scheduler = opts.scheduler or vim.schedule,
     defer = opts.defer or vim.defer_fn,
+    generation = 0,
   }, Transport)
 
+  self:_reset_parser()
+
+  return self
+end
+
+function Transport:_reset_parser()
   self.parser = jsonl.new(function(message)
     self:_dispatch(message)
   end, function(err, line)
     self.last_error = { message = err, line = line }
   end)
-
-  return self
 end
 
 function Transport:_schedule(callback)
@@ -82,7 +87,11 @@ function Transport:_reject_pending(err)
   end
 end
 
-function Transport:_on_exit(result)
+function Transport:_on_exit(result, generation)
+  if generation and generation ~= self.generation then
+    return
+  end
+  self.process = nil
   self.exited = true
   self.parser:finish()
 
@@ -113,24 +122,33 @@ function Transport:start(callback)
     return
   end
 
+  self.generation = self.generation + 1
+  local generation = self.generation
+  self.stopped = false
+  self.exited = false
+  self.stderr = ""
+  self:_reset_parser()
+
   local ok, process_or_err = pcall(self.launcher, self.cmd, {
     stdin = true,
     text = true,
     stdout = function(_, chunk)
       self:_schedule(function()
-        if chunk then
+        if generation == self.generation and chunk then
           self.parser:push(chunk)
         end
       end)
     end,
     stderr = function(_, chunk)
       self:_schedule(function()
-        self.stderr = self.stderr .. (chunk or "")
+        if generation == self.generation then
+          self.stderr = self.stderr .. (chunk or "")
+        end
       end)
     end,
   }, function(result)
     self:_schedule(function()
-      self:_on_exit(result)
+      self:_on_exit(result, generation)
     end)
   end)
 
@@ -216,12 +234,16 @@ function Transport:stop(callback)
     self:_reject_pending(stopped_error())
   end)
 
-  if not self.process or self.process:is_closing() then
+  if not self.process then
     self:_schedule(function()
-      self:_on_exit({})
+      local stop_callback = self.stop_callback
+      self.stop_callback = nil
+      if stop_callback then stop_callback() end
     end)
     return
   end
+
+  if self.process:is_closing() then return end
 
   self.process:write(nil)
   self.defer(function()

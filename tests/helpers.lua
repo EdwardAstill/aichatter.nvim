@@ -234,17 +234,47 @@ function M.create_shadow(root, opts)
 end
 
 function M.fake_transport(responses)
+  responses = responses or {}
   local listeners = {}
-  local transport = { responded = {} }
+  local transport = {
+    responded = {},
+    requests = {},
+    responses = {},
+    starts = 0,
+    stops = 0,
+    next_id = 1,
+  }
+
+  local function resolve(response, params, callback)
+    if type(response) == "function" then
+      response(params, callback)
+    else
+      callback(nil, response)
+    end
+  end
+
+  function transport:start(callback)
+    self.starts = self.starts + 1
+    resolve(responses.__start, nil, callback or function() end)
+  end
+
+  function transport:stop(callback)
+    self.stops = self.stops + 1
+    resolve(responses.__stop, nil, callback or function() end)
+  end
 
   function transport:request(method, params, callback)
     self.responded[#self.responded + 1] = { method = method, params = params }
-    local response = responses[method]
-    if type(response) == "function" then
-      response(params, callback)
-      return
-    end
-    callback(nil, response)
+    local id = self.next_id
+    self.next_id = id + 1
+    self.requests[#self.requests + 1] = { id = id, method = method, params = params }
+    resolve(responses[method], params, callback or function() end)
+    return id
+  end
+
+  function transport:respond(id, result, err)
+    self.responses[id] = { result = result, error = err }
+    return true
   end
 
   function transport:on(method, listener)
@@ -262,14 +292,95 @@ function M.fake_transport(responses)
     end
   end
 
-  function transport:emit(method, params)
+  function transport:emit(method, params, id)
     local method_listeners = listeners[method] or {}
     for _, listener in ipairs(vim.list_slice(method_listeners)) do
-      listener(params)
+      listener(params, id)
     end
   end
 
+  function transport:server_request(id, method, params)
+    self:emit(method, params, id)
+  end
+
+  function transport:listener_count(method)
+    return #(listeners[method] or {})
+  end
+
+  function transport:total_listener_count()
+    local count = 0
+    for _, method_listeners in pairs(listeners) do
+      count = count + #method_listeners
+    end
+    return count
+  end
+
   return transport
+end
+
+function M.session_fixture(opts)
+  opts = opts or {}
+  local Context = require("aichatter.context")
+  local Session = require("aichatter.session")
+  local responses = vim.tbl_extend("force", {
+    ["turn/start"] = { turn = { id = "turn-1" } },
+    ["turn/steer"] = {},
+    ["turn/interrupt"] = {},
+    ["thread/start"] = { thread = { id = "thread-restarted" } },
+  }, opts.responses or {})
+  local transport = M.fake_transport(responses)
+  local files = opts.files
+  if files == nil then
+    files = { { path = "main.lua", status = "pending" } }
+  end
+  local review = opts.review or {
+    refresh_count = 0,
+    sync_count = 0,
+    refresh = function(self, callback)
+      self.refresh_count = self.refresh_count + 1
+      callback(nil)
+    end,
+    sync_live = function(self, callback)
+      self.sync_count = self.sync_count + 1
+      callback(nil)
+    end,
+    files = function()
+      return files
+    end,
+  }
+  local shadow = opts.shadow or {
+    project_root = "/project",
+    baseline_root = "/shadow/control/baseline",
+    workspace_root = "/shadow/workspace",
+    cleanup_count = 0,
+    cleanup = function(self, callback)
+      self.cleanup_count = self.cleanup_count + 1
+      callback()
+    end,
+  }
+  local events = {}
+  local context = opts.context or Context.new(shadow.project_root)
+  local session = Session.new({
+    transport = transport,
+    review = review,
+    shadow = shadow,
+    context = context,
+    emit = function(name, value)
+      events[#events + 1] = { name = name, value = value }
+    end,
+  })
+  session.state = opts.state or "idle"
+  session.thread_id = opts.thread_id or "thread-1"
+  session.turn_id = opts.turn_id
+  return {
+    session = session,
+    transport = transport,
+    review = review,
+    shadow = shadow,
+    context = context,
+    events = events,
+    set_files = function(value) files = value end,
+  }
 end
 
 function M.run()
