@@ -362,6 +362,7 @@ function M.session_fixture(opts)
   local context = opts.context or Context.new(shadow.project_root)
   local session = Session.new({
     transport = transport,
+    auth = opts.auth,
     review = review,
     shadow = shadow,
     context = context,
@@ -372,6 +373,7 @@ function M.session_fixture(opts)
   session.state = opts.state or "idle"
   session.thread_id = opts.thread_id or "thread-1"
   session.turn_id = opts.turn_id
+  session.started = true
   return {
     session = session,
     transport = transport,

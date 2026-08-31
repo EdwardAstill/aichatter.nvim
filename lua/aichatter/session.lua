@@ -12,10 +12,16 @@ local UPGRADE_DIAGNOSTIC =
   "Codex CLI is too old for aichatter.nvim; upgrade Codex and retry."
 
 local allowed = {
-  closed = { starting = true },
-  starting = { auth_required = true, idle = true, failed = true, closing = true },
+  closed = { starting = true, closing = true },
+  starting = {
+    auth_required = true,
+    idle = true,
+    reviewable = true,
+    failed = true,
+    closing = true,
+  },
   auth_required = { idle = true, failed = true, closing = true },
-  idle = { running = true, closing = true },
+  idle = { running = true, failed = true, closing = true },
   running = {
     waiting_for_command_approval = true,
     idle = true,
@@ -24,7 +30,7 @@ local allowed = {
     closing = true,
   },
   waiting_for_command_approval = { running = true, failed = true, closing = true },
-  reviewable = { running = true, idle = true, closing = true },
+  reviewable = { running = true, idle = true, failed = true, closing = true },
   failed = { starting = true, reviewable = true, closing = true },
   closing = { closed = true },
 }
@@ -57,15 +63,32 @@ local function state_error(message)
 end
 
 local function unsupported_v2(err)
-  local rendered = string.lower(vim.inspect(err or {}))
-  local names_required_field = rendered:find("ephemeral", 1, true)
-    or rendered:find("readonlyaccess", 1, true)
-  if not names_required_field then return false end
-  return rendered:find("unsupported", 1, true) ~= nil
-    or rendered:find("not supported", 1, true) ~= nil
-    or rendered:find("unknown", 1, true) ~= nil
-    or rendered:find("unrecognized", 1, true) ~= nil
-    or rendered:find("unexpected", 1, true) ~= nil
+  if type(err) ~= "table" or type(err.message) ~= "string" then return false end
+  local message = string.lower(err.message):gsub("[^%w]+", " ")
+  for _, field in ipairs({ "ephemeral", "readonlyaccess" }) do
+    for _, phrase in ipairs({
+      "unsupported " .. field,
+      "unsupported field " .. field,
+      "unsupported parameter " .. field,
+      "unsupported property " .. field,
+      field .. " is unsupported",
+      field .. " is not supported",
+      field .. " field is unsupported",
+      field .. " field is not supported",
+      "field " .. field .. " is unsupported",
+      "field " .. field .. " is not supported",
+      "unknown field " .. field,
+      "unknown parameter " .. field,
+      "unknown property " .. field,
+      "unrecognized field " .. field,
+      "unrecognized parameter " .. field,
+      "unexpected field " .. field,
+      "unexpected parameter " .. field,
+    }) do
+      if message:find(phrase, 1, true) then return true end
+    end
+  end
+  return false
 end
 
 local function default_review_factory(shadow)
@@ -80,6 +103,11 @@ end
 local function default_temp_parent()
   local uv = vim.uv or vim.loop
   return assert(uv.os_tmpdir(), "could not locate temporary directory")
+end
+
+local function cleanup_shadow(shadow)
+  if not shadow or type(shadow.cleanup) ~= "function" then return end
+  pcall(shadow.cleanup, shadow, noop)
 end
 
 function Session.new(deps)
@@ -103,10 +131,16 @@ function Session.new(deps)
     transcript = deps.transcript or {},
     pending_commands = {},
     handlers = {},
+    operations = {},
+    generation = 0,
     restart_attempted = false,
+    started = false,
+    disposed = false,
     _sending = false,
     _close_callbacks = nil,
     _assistant_entry = nil,
+    _pending_turn = nil,
+    _expected_exit = false,
   }, Session)
   self:_register_handlers()
   return self
@@ -136,11 +170,41 @@ function Session:_unregister_handlers()
   self.handlers = {}
 end
 
-function Session:_matches_active(params)
-  if not self.turn_id then return false end
-  if params and params.threadId and params.threadId ~= self.thread_id then return false end
-  if params and params.turnId and params.turnId ~= self.turn_id then return false end
-  return true
+function Session:_new_operation(callback)
+  local operation = {
+    callback = public_callback(callback),
+    generation = self.generation,
+    finished = false,
+  }
+  self.operations[operation] = true
+  return operation
+end
+
+function Session:_finish_operation(operation, ...)
+  if not operation or operation.finished then return end
+  operation.finished = true
+  self.operations[operation] = nil
+  operation.callback(...)
+end
+
+function Session:_operation_current(operation)
+  return operation and not operation.finished and not self.disposed
+    and operation.generation == self.generation
+end
+
+function Session:_generation_current(generation)
+  return not self.disposed and generation == self.generation
+end
+
+function Session:_invalidate_operations(err)
+  self.generation = self.generation + 1
+  self._sending = false
+  self._pending_turn = nil
+  local pending = {}
+  for operation in pairs(self.operations) do pending[#pending + 1] = operation end
+  for _, operation in ipairs(pending) do
+    self:_finish_operation(operation, error_value(err))
+  end
 end
 
 function Session:_record_error(err)
@@ -149,15 +213,13 @@ function Session:_record_error(err)
   self:_emit("error", normalized)
 end
 
-function Session:_fail(err, callback)
+function Session:_fail(err, operation)
   err = error_value(err)
-  if self.state ~= "failed" then
-    if allowed[self.state] and allowed[self.state].failed then
-      self:_transition("failed")
-    end
+  if self.state ~= "failed" and allowed[self.state] and allowed[self.state].failed then
+    self:_transition("failed")
   end
   self:_record_error(err)
-  if callback then callback(err) end
+  self:_finish_operation(operation, err)
 end
 
 function Session:_required_v2_error(err)
@@ -165,8 +227,35 @@ function Session:_required_v2_error(err)
   return error_value(err)
 end
 
-function Session:_on_delta(params)
-  if not self:_matches_active(params) then return end
+function Session:_matches_active(params)
+  if not self.turn_id then return false end
+  if params and params.threadId and params.threadId ~= self.thread_id then return false end
+  if params and params.turnId and params.turnId ~= self.turn_id then return false end
+  return true
+end
+
+function Session:_candidate_turn_id(method, params)
+  if method == "turn/completed" then
+    return params and params.turn and params.turn.id
+  end
+  return params and params.turnId
+end
+
+function Session:_queue_candidate(method, params)
+  local candidate = self._pending_turn
+  if not candidate or candidate.generation ~= self.generation then return false end
+  if params and params.threadId and params.threadId ~= self.thread_id then return false end
+  local turn_id = self:_candidate_turn_id(method, params)
+  if type(turn_id) ~= "string" or turn_id == "" then return false end
+  candidate.notifications[#candidate.notifications + 1] = {
+    method = method,
+    params = params,
+    turn_id = turn_id,
+  }
+  return true
+end
+
+function Session:_process_delta(params)
   if not self._assistant_entry then
     self._assistant_entry = { type = "assistant", text = "" }
     self.transcript[#self.transcript + 1] = self._assistant_entry
@@ -175,14 +264,67 @@ function Session:_on_delta(params)
   self:_emit("item/agentMessage/delta", params)
 end
 
-function Session:_on_item(method, status, params)
-  if not self:_matches_active(params) then return end
+function Session:_process_item(method, status, params)
   self.transcript[#self.transcript + 1] = {
     type = "activity",
     status = status,
     item = params and params.item or params,
   }
   self:_emit(method, params)
+end
+
+function Session:_retire_commands(status, decision, connected)
+  local retired = false
+  for request_id, pending in pairs(self.pending_commands) do
+    retired = true
+    pending.entry.status = status
+    pending.entry.decision = decision
+    if connected and decision and not pending.responded then
+      pending.responded = true
+      local ok, err = self.transport:respond(request_id, { decision = decision })
+      if not ok and err then self:_record_error(err) end
+    end
+    self.pending_commands[request_id] = nil
+  end
+  return retired
+end
+
+function Session:_process_turn_completed(params)
+  local turn = params and params.turn or {}
+  if not self.turn_id or turn.id ~= self.turn_id then return end
+  self.turn_id = nil
+  self._assistant_entry = nil
+  if self.state == "waiting_for_command_approval" then
+    self:_retire_commands("expired", "decline", true)
+    self:_transition("running")
+  end
+  if self.state ~= "running" then return end
+  self:_emit("turn/completed", params)
+  local generation = self.generation
+  local completed = once(function(err)
+    if not self:_generation_current(generation) then return end
+    if err then self:_fail(err); return end
+    local files = self.review:files()
+    self:_transition(#files > 0 and "reviewable" or "idle")
+  end)
+  local ok, thrown = pcall(self.review.refresh, self.review, completed)
+  if not ok then completed(error_value(thrown)) end
+end
+
+function Session:_receive_turn_notification(method, params)
+  if self:_matches_active(params) then
+    if method == "item/agentMessage/delta" then
+      self:_process_delta(params)
+    elseif method == "item/started" then
+      self:_process_item(method, "started", params)
+    elseif method == "item/completed" then
+      self:_process_item(method, "completed", params)
+    elseif method == "turn/completed" then
+      self:_process_turn_completed(params)
+    end
+    return
+  end
+  self:_queue_candidate(method, params)
 end
 
 function Session:_on_protocol_error(params)
@@ -218,7 +360,7 @@ function Session:_on_command_approval(params, request_id)
     request = params,
     status = "pending",
   }
-  self.pending_commands[request_id] = { params = params, entry = entry }
+  self.pending_commands[request_id] = { params = params, entry = entry, responded = false }
   self.transcript[#self.transcript + 1] = entry
   self:_transition("waiting_for_command_approval")
   self:_emit("item/commandExecution/requestApproval", {
@@ -227,65 +369,15 @@ function Session:_on_command_approval(params, request_id)
   })
 end
 
-function Session:_on_turn_completed(params)
-  local turn = params and params.turn or {}
-  if not self.turn_id or turn.id ~= self.turn_id then return end
-  self.turn_id = nil
-  self._assistant_entry = nil
-  if self.state == "waiting_for_command_approval" then
-    self.pending_commands = {}
-    self:_transition("running")
-  end
-  if self.state ~= "running" then return end
-  self:_emit("turn/completed", params)
-  local completed = once(function(err)
-    if self.state == "closing" or self.state == "closed" then return end
-    if err then
-      self:_fail(err)
-      return
-    end
-    local files = self.review:files()
-    self:_transition(#files > 0 and "reviewable" or "idle")
-  end)
-  local ok, thrown = pcall(self.review.refresh, self.review, completed)
-  if not ok then completed(error_value(thrown)) end
-end
-
-function Session:_on_exit(result)
-  if self.state == "closing" or self.state == "closed" then return end
-  local err = {
-    message = "app-server exited unexpectedly",
-    code = result and result.code,
-    signal = result and result.signal,
-  }
-  self.turn_id = nil
-  self._assistant_entry = nil
-  self.pending_commands = {}
-  self._sending = false
-  if self.state ~= "failed" and allowed[self.state] and allowed[self.state].failed then
-    self:_transition("failed")
-  end
-  self:_record_error(err)
-  if self.restart_attempted or self.state ~= "failed" then return end
-  self.restart_attempted = true
-  self:_transition("starting")
-  self:_emit("restart", { attempt = 1 })
-  local restarted = once(function(start_err)
-    if start_err then
-      self:_fail(start_err)
-      return
-    end
-    self:_start_thread(nil, true)
-  end)
-  local ok, thrown = pcall(self.transport.start, self.transport, restarted)
-  if not ok then restarted(error_value(thrown)) end
-end
-
 function Session:_register_handlers()
-  self:_listen("item/agentMessage/delta", function(params) self:_on_delta(params) end)
-  self:_listen("item/started", function(params) self:_on_item("item/started", "started", params) end)
-  self:_listen("item/completed", function(params) self:_on_item("item/completed", "completed", params) end)
-  self:_listen("turn/completed", function(params) self:_on_turn_completed(params) end)
+  for _, method in ipairs({
+    "item/agentMessage/delta",
+    "item/started",
+    "item/completed",
+    "turn/completed",
+  }) do
+    self:_listen(method, function(params) self:_receive_turn_notification(method, params) end)
+  end
   self:_listen("item/fileChange/requestApproval",
     function(params, id) self:_on_file_approval(params, id) end)
   self:_listen("item/commandExecution/requestApproval",
@@ -295,8 +387,12 @@ function Session:_register_handlers()
   self:_listen("exit", function(result) self:_on_exit(result) end)
 end
 
-function Session:_start_thread(callback, restarting)
-  callback = callback and once(callback) or noop
+function Session:_start_thread(generation, operation, opts)
+  opts = opts or {}
+  if not self.shadow or not self.shadow.workspace_root then
+    self:_fail({ message = "cannot start a thread without a shadow workspace" }, operation)
+    return
+  end
   local params = {
     ephemeral = true,
     cwd = self.shadow.workspace_root,
@@ -304,44 +400,54 @@ function Session:_start_thread(callback, restarting)
     sandbox = "workspaceWrite",
   }
   local completed = once(function(err, result)
+    if not self:_generation_current(generation) then return end
     if err then
-      self:_fail(self:_required_v2_error(err), callback)
+      self:_fail(self:_required_v2_error(err), operation)
       return
     end
     local thread_id = result and result.thread and result.thread.id
     if type(thread_id) ~= "string" or thread_id == "" then
-      self:_fail({ message = "thread/start returned no thread id" }, callback)
+      self:_fail({ message = "thread/start returned no thread id" }, operation)
       return
     end
     self.thread_id = thread_id
-    self:_transition("idle")
-    if restarting then self:_emit("restarted", { threadId = thread_id }) end
-    callback(nil, result)
+    local target = opts.target or "idle"
+    self:_transition(target)
+    if opts.restarting then self:_emit("restarted", { threadId = thread_id }) end
+    self:_finish_operation(operation, nil, result)
   end)
-  local ok, thrown = pcall(self.transport.request, self.transport, "thread/start", params, completed)
+  local ok, thrown = pcall(self.transport.request, self.transport,
+    "thread/start", params, completed)
   if not ok then completed(error_value(thrown)) end
 end
 
-function Session:_ensure_workspace(callback)
-  callback = once(callback)
+function Session:_ensure_workspace(generation, operation, opts)
+  opts = opts or {}
   local function start_thread()
     if not self.review then
       local ok, value = pcall(self.review_factory, self.shadow)
-      if not ok then callback(error_value(value)); return end
+      if not ok then self:_fail(error_value(value), operation); return end
       self.review = value
     end
     if not self.context then
       self.context = Context.new(self.shadow.project_root or self.root)
     end
-    self:_start_thread(callback)
+    self:_start_thread(generation, operation, opts)
   end
   if self.shadow then
     start_thread()
     return
   end
   local created = once(function(err, shadow)
-    if err then callback(err); return end
-    if not shadow then callback({ message = "shadow creation returned no workspace" }); return end
+    if not self:_generation_current(generation) then
+      if shadow then cleanup_shadow(shadow) end
+      return
+    end
+    if err then self:_fail(err, operation); return end
+    if not shadow then
+      self:_fail({ message = "shadow creation returned no workspace" }, operation)
+      return
+    end
     self.shadow = shadow
     start_thread()
   end)
@@ -352,52 +458,120 @@ function Session:_ensure_workspace(callback)
   if not ok then created(error_value(thrown)) end
 end
 
-function Session:start(callback)
-  callback = public_callback(callback)
-  if self.state ~= "closed" and self.state ~= "failed" then
-    callback(state_error("session can only start while closed or failed"))
-    return
-  end
-  self:_transition("starting")
+function Session:_initialize_after_transport(generation, operation, opts)
+  opts = opts or {}
+  local checked = once(function(err, account)
+    if not self:_generation_current(generation) then return end
+    if err then self:_fail(err, operation); return end
+    if not account or not account.authenticated then
+      self:_transition("auth_required")
+      self:_finish_operation(operation, nil, account)
+      return
+    end
+    self:_ensure_workspace(generation, operation, opts)
+  end)
+  local ok, thrown = pcall(self.auth.check, self.auth, checked)
+  if not ok then checked(error_value(thrown)) end
+end
+
+function Session:_start_transport(generation, operation, opts)
+  opts = opts or {}
   local started = once(function(err)
-    if err then self:_fail(err, callback); return end
-    local checked = once(function(auth_err, account)
-      if auth_err then self:_fail(auth_err, callback); return end
-      if not account or not account.authenticated then
-        self:_transition("auth_required")
-        callback(nil, account)
-        return
-      end
-      self:_ensure_workspace(function(workspace_err, result)
-        if workspace_err and self.state ~= "failed" then self:_fail(workspace_err, callback)
-        elseif workspace_err then callback(workspace_err)
-        else callback(nil, result) end
-      end)
-    end)
-    local ok, thrown = pcall(self.auth.check, self.auth, checked)
-    if not ok then checked(error_value(thrown)) end
+    if not self:_generation_current(generation) then return end
+    if err then self:_fail(err, operation); return end
+    if opts.recovery and self.shadow then
+      self:_ensure_workspace(generation, operation, opts)
+    else
+      self:_initialize_after_transport(generation, operation, opts)
+    end
   end)
   local ok, thrown = pcall(self.transport.start, self.transport, started)
   if not ok then started(error_value(thrown)) end
 end
 
+function Session:_on_exit(result)
+  if self._expected_exit or self.disposed or not self.started
+    or self.state == "closing" then return end
+  local previous_state = self.state
+  local err = {
+    message = "app-server exited unexpectedly",
+    code = result and result.code,
+    signal = result and result.signal,
+  }
+  self:_retire_commands("failed", nil, false)
+  self:_invalidate_operations(err)
+  self.turn_id = nil
+  self.thread_id = nil
+  self._assistant_entry = nil
+  if self.state ~= "failed" and allowed[self.state] and allowed[self.state].failed then
+    self:_transition("failed")
+  end
+  self:_record_error(err)
+  if self.restart_attempted or self.state ~= "failed" then return end
+  self.restart_attempted = true
+  self:_transition("starting")
+  self:_emit("restart", { attempt = 1 })
+  local target = previous_state == "reviewable" and "reviewable" or "idle"
+  self:_start_transport(self.generation, nil, {
+    recovery = true,
+    restarting = true,
+    target = target,
+  })
+end
+
+function Session:start(callback)
+  callback = public_callback(callback)
+  if self.disposed then
+    callback(state_error("session is disposed and cannot be reopened"))
+    return
+  end
+  if self.state ~= "closed" and self.state ~= "failed" then
+    callback(state_error("session can only start while closed or failed"))
+    return
+  end
+  if self.state == "failed" then
+    self:_invalidate_operations({ message = "session retrying" })
+    local operation = self:_new_operation(callback)
+    local generation = self.generation
+    self.restart_attempted = false
+    self._expected_exit = true
+    local stopped = once(function(err)
+      self._expected_exit = false
+      if not self:_operation_current(operation) then return end
+      if err then self:_fail(err, operation); return end
+      self:_transition("starting")
+      self:_start_transport(generation, operation, { target = "idle" })
+    end)
+    local ok, thrown = pcall(self.transport.stop, self.transport, stopped)
+    if not ok then stopped(error_value(thrown)) end
+    return
+  end
+  self.started = true
+  local operation = self:_new_operation(callback)
+  self:_transition("starting")
+  self:_start_transport(self.generation, operation, { target = "idle" })
+end
+
 function Session:login(callback)
   callback = public_callback(callback)
+  if self.disposed then
+    callback(state_error("session is disposed"))
+    return
+  end
   if self.state ~= "auth_required" then
     callback(state_error("login requires an auth_required session"))
     return
   end
-  local logged_in = once(function(err, result)
+  local operation = self:_new_operation(callback)
+  local generation = self.generation
+  local logged_in = once(function(err)
+    if not self:_operation_current(operation) then return end
     if err then
       self:_record_error(err)
-      callback(err)
+      self:_finish_operation(operation, err)
       return
     end
-    self:_ensure_workspace(function(workspace_err, thread)
-      if workspace_err and self.state ~= "failed" then self:_fail(workspace_err, callback)
-      elseif workspace_err then callback(workspace_err)
-      else callback(nil, thread or result) end
-    end)
+    self:_ensure_workspace(generation, operation, { target = "idle" })
   end)
   local ok, thrown = pcall(self.auth.login, self.auth, logged_in)
   if not ok then logged_in(error_value(thrown)) end
@@ -418,6 +592,7 @@ end
 
 function Session:send(text, callback)
   callback = public_callback(callback)
+  if self.disposed then callback(state_error("session is disposed")); return end
   if (self.state ~= "idle" and self.state ~= "reviewable") or self._sending then
     callback(state_error("send requires an idle or reviewable session"))
     return
@@ -430,31 +605,34 @@ function Session:send(text, callback)
     callback(state_error("session is not initialized"))
     return
   end
+  local operation = self:_new_operation(callback)
+  local generation = self.generation
   self._sending = true
   local synced = once(function(sync_err)
+    if not self:_operation_current(operation) then return end
     self._sending = false
-    if self.state == "closing" or self.state == "closed" then
-      callback(state_error("session closed while synchronizing"))
-      return
-    end
     if sync_err then
       sync_err = error_value(sync_err)
       if sync_err.code == "conflict" then self:_emit("conflict", sync_err) end
-      callback(sync_err)
+      self:_finish_operation(operation, sync_err)
       return
     end
     local ok_inputs, inputs = pcall(self.context.inputs, self.context, text)
-    if not ok_inputs then callback(error_value(inputs)); return end
+    if not ok_inputs then self:_finish_operation(operation, error_value(inputs)); return end
     self:_transition("running")
     self._assistant_entry = nil
+    local candidate = { generation = generation, notifications = {} }
+    self._pending_turn = candidate
     local completed = once(function(err, result)
+      if not self:_operation_current(operation) then return end
+      self._pending_turn = nil
       if err then
-        self:_fail(self:_required_v2_error(err), callback)
+        self:_fail(self:_required_v2_error(err), operation)
         return
       end
       local turn_id = result and result.turn and result.turn.id
       if type(turn_id) ~= "string" or turn_id == "" then
-        self:_fail({ message = "turn/start returned no turn id" }, callback)
+        self:_fail({ message = "turn/start returned no turn id" }, operation)
         return
       end
       self.turn_id = turn_id
@@ -462,21 +640,21 @@ function Session:send(text, callback)
       local entry = { type = "user", text = text, input = inputs }
       self.transcript[#self.transcript + 1] = entry
       self:_emit("user", entry)
-      callback(nil, result)
+      self:_finish_operation(operation, nil, result)
+      for _, notification in ipairs(candidate.notifications) do
+        if notification.turn_id == turn_id and self:_generation_current(generation) then
+          self:_receive_turn_notification(notification.method, notification.params)
+        end
+      end
     end)
     local params = {
       threadId = self.thread_id,
       input = inputs,
       sandboxPolicy = self:_turn_policy(),
     }
-    local requested, thrown = pcall(
-      self.transport.request,
-      self.transport,
-      "turn/start",
-      params,
-      completed
-    )
-    if not requested then completed(error_value(thrown)) end
+    local ok, thrown = pcall(self.transport.request, self.transport,
+      "turn/start", params, completed)
+    if not ok then completed(error_value(thrown)) end
   end)
   local ok, thrown = pcall(self.review.sync_live, self.review, synced)
   if not ok then synced(error_value(thrown)) end
@@ -484,6 +662,7 @@ end
 
 function Session:steer(text, callback)
   callback = public_callback(callback)
+  if self.disposed then callback(state_error("session is disposed")); return end
   if self.state ~= "running" or not self.turn_id then
     callback(state_error("steer requires an active turn"))
     return
@@ -492,9 +671,11 @@ function Session:steer(text, callback)
     callback({ code = "invalid_prompt", message = "steer text must not be blank" })
     return
   end
+  local operation = self:_new_operation(callback)
   local completed = once(function(err, result)
+    if not self:_operation_current(operation) then return end
     if err then self:_record_error(err) end
-    callback(err, result)
+    self:_finish_operation(operation, err, result)
   end)
   local ok, thrown = pcall(self.transport.request, self.transport, "turn/steer", {
     threadId = self.thread_id,
@@ -512,6 +693,7 @@ function Session:approve_command(request_id, decision)
   end
   local ok, err = self.transport:respond(request_id, { decision = decision })
   if not ok then return false, err end
+  pending.responded = true
   pending.entry.status = "decided"
   pending.entry.decision = decision
   self.pending_commands[request_id] = nil
@@ -521,14 +703,21 @@ end
 
 function Session:cancel(callback)
   callback = public_callback(callback)
+  if self.disposed then callback(state_error("session is disposed")); return end
   if (self.state ~= "running" and self.state ~= "waiting_for_command_approval")
     or not self.turn_id then
     callback(state_error("cancel requires an active turn"))
     return
   end
+  if self.state == "waiting_for_command_approval" then
+    self:_retire_commands("cancelled", "cancel", true)
+    self:_transition("running")
+  end
+  local operation = self:_new_operation(callback)
   local completed = once(function(err, result)
+    if not self:_operation_current(operation) then return end
     if err then self:_record_error(err) end
-    callback(err, result)
+    self:_finish_operation(operation, err, result)
   end)
   local ok, thrown = pcall(self.transport.request, self.transport, "turn/interrupt", {
     threadId = self.thread_id,
@@ -539,18 +728,20 @@ end
 
 function Session:close(callback)
   callback = public_callback(callback)
-  if self.state == "closed" then callback(); return end
   if self.state == "closing" then
     self._close_callbacks[#self._close_callbacks + 1] = callback
     return
   end
+  if self.disposed then callback(); return end
   self._close_callbacks = { callback }
   local active_turn = self.turn_id
+  self:_retire_commands("cancelled", "cancel", true)
+  self:_invalidate_operations({ message = "session closing" })
   self:_transition("closing")
+  self.disposed = true
   self:_unregister_handlers()
-  self._sending = false
   self.turn_id = nil
-  self.pending_commands = {}
+  self._assistant_entry = nil
   if active_turn then
     pcall(self.transport.request, self.transport, "turn/interrupt", {
       threadId = self.thread_id,
@@ -564,6 +755,8 @@ function Session:close(callback)
     remaining = remaining - 1
     if remaining ~= 0 then return end
     self:_transition("closed")
+    self.thread_id = nil
+    self.shadow = nil
     local callbacks = self._close_callbacks
     self._close_callbacks = nil
     for _, close_callback in ipairs(callbacks) do close_callback(first_error) end

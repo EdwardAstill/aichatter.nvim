@@ -517,6 +517,410 @@ h.test("close cleans handlers and calls completion once", function()
   h.eq("closed", session.state)
 end)
 
+h.test("close settles a send before a delayed live sync returns", function()
+  local sync_callback
+  local review = {
+    refresh = function(_, callback) callback() end,
+    files = function() return {} end,
+    sync_live = function(_, callback) sync_callback = callback end,
+  }
+  local fixture = h.session_fixture({ review = review, files = {} })
+  local calls, send_error = 0
+  fixture.session:send("Wait", function(err)
+    calls = calls + 1
+    send_error = err
+  end)
+
+  fixture.session:close()
+
+  h.eq(1, calls)
+  h.matches("clos", send_error.message)
+  h.eq("closed", fixture.session.state)
+  sync_callback()
+  h.eq(1, calls)
+  h.eq(0, #requests(fixture.transport, "turn/start"))
+end)
+
+h.test("ignores a delayed review refresh after exit recovery", function()
+  local refresh_callback
+  local review = {
+    refresh_count = 0,
+    sync_live = function(_, callback) callback() end,
+    refresh = function(self, callback)
+      self.refresh_count = self.refresh_count + 1
+      refresh_callback = callback
+    end,
+    files = function() return { { path = "main.lua", status = "pending" } } end,
+  }
+  local fixture = h.session_fixture({ review = review })
+  fixture.session:send("Change")
+  fixture.transport:emit("turn/completed", {
+    turn = { id = "turn-1", status = "completed" },
+  })
+  fixture.transport:emit("exit", { code = 23 })
+
+  local ok = pcall(refresh_callback)
+
+  h.truthy(ok)
+  h.eq("idle", fixture.session.state)
+  h.eq(1, fixture.transport.starts)
+end)
+
+h.test("cleans a stale shadow returned after exit and reruns missing prerequisites", function()
+  local create_callbacks = {}
+  local stale_cleanup = 0
+  local start_calls, start_error = 0
+  local transport = h.fake_transport({
+    ["thread/start"] = { thread = { id = "thread-new" } },
+  })
+  local auth = {
+    check = function(_, callback) callback(nil, { authenticated = true }) end,
+  }
+  local session = Session.new({
+    transport = transport,
+    auth = auth,
+    root = "/project",
+    create_shadow = function(_, callback)
+      create_callbacks[#create_callbacks + 1] = callback
+    end,
+    review_factory = function() return {
+      refresh = function(_, callback) callback() end,
+      sync_live = function(_, callback) callback() end,
+      files = function() return {} end,
+    } end,
+    emit = function() end,
+  })
+  session:start(function(err)
+    start_calls = start_calls + 1
+    start_error = err
+  end)
+
+  local emitted = pcall(function() transport:emit("exit", { code = 23 }) end)
+
+  h.truthy(emitted)
+  h.eq(1, start_calls)
+  h.matches("exited", start_error.message)
+  h.eq(2, #create_callbacks)
+  create_callbacks[1](nil, {
+    project_root = "/project",
+    baseline_root = "/stale/control/baseline",
+    workspace_root = "/stale/workspace",
+    cleanup = function(_, callback)
+      stale_cleanup = stale_cleanup + 1
+      callback()
+    end,
+  })
+  h.eq(1, stale_cleanup)
+  create_callbacks[2](nil, {
+    project_root = "/project",
+    baseline_root = "/current/control/baseline",
+    workspace_root = "/current/workspace",
+    cleanup = function(_, callback) callback() end,
+  })
+  h.eq("idle", session.state)
+  h.eq("/current/workspace", session.shadow.workspace_root)
+end)
+
+h.test("ignores a delayed restart callback after terminal close", function()
+  local restart_callback
+  local fixture = h.session_fixture({
+    responses = {
+      __start = function(_, callback) restart_callback = callback end,
+    },
+  })
+
+  fixture.transport:emit("exit", { code = 23 })
+  fixture.session:close()
+  local ok = pcall(restart_callback)
+
+  h.truthy(ok)
+  h.eq("closed", fixture.session.state)
+  h.eq(0, #requests(fixture.transport, "thread/start"))
+end)
+
+h.test("replays matching turn notifications received before start response", function()
+  local turn_callback
+  local fixture = h.session_fixture({
+    responses = {
+      ["turn/start"] = function(_, callback) turn_callback = callback end,
+    },
+  })
+  local send_calls = 0
+  fixture.session:send("Early", function(err)
+    h.eq(nil, err)
+    send_calls = send_calls + 1
+  end)
+  fixture.transport:emit("item/agentMessage/delta", {
+    threadId = "thread-1",
+    turnId = "turn-early",
+    delta = "before response",
+  })
+  fixture.transport:emit("turn/completed", {
+    threadId = "thread-1",
+    turn = { id = "turn-early", status = "completed" },
+  })
+
+  turn_callback(nil, { turn = { id = "turn-early" } })
+
+  h.eq(1, send_calls)
+  h.eq("before response", fixture.session.transcript[2].text)
+  h.eq(1, fixture.review.refresh_count)
+  h.eq("reviewable", fixture.session.state)
+  h.eq({ "state", "user", "item/agentMessage/delta", "turn/completed", "state" },
+    event_names(fixture.events))
+end)
+
+h.test("discards buffered notifications for a different candidate turn", function()
+  local turn_callback
+  local fixture = h.session_fixture({
+    responses = {
+      ["turn/start"] = function(_, callback) turn_callback = callback end,
+    },
+  })
+  fixture.session:send("Early")
+  fixture.transport:emit("item/agentMessage/delta", {
+    threadId = "thread-1",
+    turnId = "turn-other",
+    delta = "wrong turn",
+  })
+
+  turn_callback(nil, { turn = { id = "turn-right" } })
+
+  h.eq(1, #fixture.session.transcript)
+  h.eq("user", fixture.session.transcript[1].type)
+  h.eq("running", fixture.session.state)
+end)
+
+h.test("discards buffered candidate notifications when turn start fails", function()
+  local turn_callback
+  local context = Context.new("/project")
+  context:add_file("main.lua")
+  local fixture = h.session_fixture({
+    context = context,
+    responses = {
+      ["turn/start"] = function(_, callback) turn_callback = callback end,
+    },
+  })
+  fixture.session:send("Early")
+  fixture.transport:emit("item/agentMessage/delta", {
+    threadId = "thread-1",
+    turnId = "turn-early",
+    delta = "discard me",
+  })
+
+  turn_callback({ message = "turn rejected" })
+
+  h.eq("failed", fixture.session.state)
+  h.eq(1, #fixture.session.transcript)
+  h.eq("error", fixture.session.transcript[1].type)
+  h.eq(2, #context:inputs("Retry"))
+end)
+
+h.test("restarts idle and reviewable sessions and fails their second exit", function()
+  for _, value in ipairs({ "idle", "reviewable" }) do
+    local fixture = h.session_fixture({ state = value })
+
+    fixture.transport:emit("exit", { code = 23 })
+    h.eq(value, fixture.session.state)
+    h.eq(1, fixture.transport.starts)
+
+    fixture.transport:emit("exit", { code = 24 })
+    h.eq("failed", fixture.session.state)
+    h.eq(1, fixture.transport.starts)
+  end
+end)
+
+h.test("reinitializes auth without thread-starting when an auth-required server exits", function()
+  local checks = 0
+  local transport = h.fake_transport({
+    ["thread/start"] = { thread = { id = "must-not-start" } },
+  })
+  local session = Session.new({
+    transport = transport,
+    auth = {
+      check = function(_, callback)
+        checks = checks + 1
+        callback(nil, { authenticated = false })
+      end,
+    },
+    create_shadow = function() error("shadow must not be created") end,
+    emit = function() end,
+  })
+  session:start()
+  h.eq("auth_required", session.state)
+
+  local ok = pcall(function() transport:emit("exit", { code = 23 }) end)
+
+  h.truthy(ok)
+  h.eq("auth_required", session.state)
+  h.eq(2, checks)
+  h.eq(0, #requests(transport, "thread/start"))
+end)
+
+h.test("fresh close tears down handlers once and permanently rejects reopen", function()
+  local transport = h.fake_transport({})
+  local session = Session.new({ transport = transport, emit = function() end })
+  local close_calls = 0
+
+  session:close(function(err)
+    h.eq(nil, err)
+    close_calls = close_calls + 1
+  end)
+  session:close(function(err)
+    h.eq(nil, err)
+    close_calls = close_calls + 1
+  end)
+  local start_error
+  session:start(function(err) start_error = err end)
+
+  h.eq(2, close_calls)
+  h.eq(1, transport.stops)
+  h.eq(0, transport:total_listener_count())
+  h.matches("disposed", start_error.message)
+  h.eq(0, transport.starts)
+end)
+
+h.test("does not infer unsupported v2 fields from nested error payload data", function()
+  local original = {
+    code = -32602,
+    message = "request rejected",
+    data = { diagnostic = "unknown field readOnlyAccess" },
+  }
+  local fixture = h.session_fixture({
+    responses = {
+      ["turn/start"] = function(_, callback) callback(original) end,
+    },
+  })
+  local captured
+
+  fixture.session:send("Try", function(err) captured = err end)
+
+  h.eq("request rejected", captured.message)
+  h.eq(original.data, captured.data)
+end)
+
+h.test("requires an unsupported phrase to name the restricted v2 field", function()
+  local original = {
+    code = -32602,
+    message = "ephemeral=true was accepted; unsupported field executionMode",
+  }
+  local fixture = h.session_fixture({
+    responses = {
+      ["turn/start"] = function(_, callback) callback(original) end,
+    },
+  })
+  local captured
+
+  fixture.session:send("Try", function(err) captured = err end)
+
+  h.eq(original.message, captured.message)
+end)
+
+local function pending_command_fixture()
+  local fixture = h.session_fixture({ files = {} })
+  fixture.session:send("Run")
+  fixture.transport:server_request(77, "item/commandExecution/requestApproval", {
+    threadId = "thread-1",
+    turnId = "turn-1",
+    itemId = "command-1",
+    command = "make test",
+  })
+  return fixture, fixture.session.transcript[#fixture.session.transcript]
+end
+
+h.test("expires and declines a pending command on turn completion", function()
+  local fixture, entry = pending_command_fixture()
+
+  fixture.transport:emit("turn/completed", {
+    turn = { id = "turn-1", status = "completed" },
+  })
+
+  h.eq("expired", entry.status)
+  h.eq("decline", fixture.transport.responses[77].result.decision)
+  h.falsy(fixture.session:approve_command(77, "accept"))
+end)
+
+h.test("cancels a pending command before interrupting its turn", function()
+  local fixture, entry = pending_command_fixture()
+
+  fixture.session:cancel()
+
+  h.eq("cancelled", entry.status)
+  h.eq("cancel", fixture.transport.responses[77].result.decision)
+  h.falsy(fixture.session:approve_command(77, "accept"))
+end)
+
+h.test("fails a pending command without responding after transport exit", function()
+  local fixture, entry = pending_command_fixture()
+
+  fixture.transport:emit("exit", { code = 23 })
+
+  h.eq("failed", entry.status)
+  h.eq(nil, fixture.transport.responses[77])
+  h.falsy(fixture.session:approve_command(77, "accept"))
+end)
+
+h.test("cancels a pending command once before close stops transport", function()
+  local fixture, entry = pending_command_fixture()
+
+  fixture.session:close()
+
+  h.eq("cancelled", entry.status)
+  h.eq("cancel", fixture.transport.responses[77].result.decision)
+  h.falsy(fixture.session:approve_command(77, "accept"))
+end)
+
+h.test("stops a live failed transport before retrying after a CLI upgrade", function()
+  local upgraded = false
+  local fixture = h.session_fixture({
+    responses = {
+      ["account/read"] = { account = { type = "chatgpt" }, requiresOpenaiAuth = true },
+      ["thread/start"] = { thread = { id = "thread-upgraded" } },
+      ["turn/start"] = function(_, callback)
+        if upgraded then
+          callback(nil, { turn = { id = "turn-upgraded" } })
+        else
+          callback({ code = -32602, message = "unknown field readOnlyAccess" })
+        end
+      end,
+    },
+  })
+  local connected = true
+  function fixture.transport:start(callback)
+    self.starts = self.starts + 1
+    if connected then
+      callback({ message = "transport already started" })
+    else
+      connected = true
+      callback()
+    end
+  end
+  function fixture.transport:stop(callback)
+    self.stops = self.stops + 1
+    connected = false
+    callback()
+  end
+  fixture.session:send("Before upgrade")
+  h.eq("failed", fixture.session.state)
+  upgraded = true
+  local retry_calls, retry_error = 0
+
+  fixture.session:start(function(err)
+    retry_calls = retry_calls + 1
+    retry_error = err
+  end)
+
+  h.eq(nil, retry_error)
+  h.eq(1, retry_calls)
+  h.eq(1, fixture.transport.stops)
+  h.eq(1, fixture.transport.starts)
+  h.eq("idle", fixture.session.state)
+  fixture.session:send("After upgrade")
+  local turns = requests(fixture.transport, "turn/start")
+  h.eq("restricted", turns[#turns].params.sandboxPolicy.readOnlyAccess.type)
+  h.eq(false, turns[#turns].params.sandboxPolicy.networkAccess)
+end)
+
 h.test("fake app-server supports authenticated and account-required startup", function()
   local authenticated = real_server_fixture("authenticated")
   authenticated.session:start()
