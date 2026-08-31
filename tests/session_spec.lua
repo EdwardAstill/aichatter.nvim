@@ -244,6 +244,61 @@ h.test("applies a selected model to future turns", function()
   h.eq("gpt-5.6-terra", fixture.events[1].value)
 end)
 
+h.test("uses supported reasoning effort and resets it for a different model", function()
+  local fixture = h.session_fixture({
+    files = {},
+    responses = {
+      ["model/list"] = {
+        data = {
+          {
+            id = "gpt-5.6-sol",
+            model = "gpt-5.6-sol",
+            displayName = "GPT-5.6-Sol",
+            hidden = false,
+            defaultReasoningEffort = "low",
+            supportedReasoningEfforts = {
+              { reasoningEffort = "low", description = "Fast responses" },
+              { reasoningEffort = "high", description = "Deeper reasoning" },
+            },
+            inputModalities = { "text", "image" },
+            supportsPersonality = true,
+            isDefault = true,
+          },
+          {
+            id = "gpt-5.6-terra",
+            model = "gpt-5.6-terra",
+            displayName = "GPT-5.6-Terra",
+            hidden = false,
+            defaultReasoningEffort = "medium",
+            supportedReasoningEfforts = {
+              { reasoningEffort = "medium", description = "Balanced reasoning" },
+            },
+            inputModalities = { "text", "image" },
+            supportsPersonality = true,
+            isDefault = false,
+          },
+        },
+        nextCursor = vim.NIL,
+      },
+    },
+  })
+  fixture.session.model = "gpt-5.6-sol"
+  fixture.session:list_models(function(err) h.eq(nil, err) end)
+
+  h.eq("low", fixture.session.reasoning_effort)
+  local ok, err = fixture.session:select_reasoning("high")
+  h.truthy(ok)
+  h.eq(nil, err)
+  fixture.session:send("Think harder")
+  h.eq("high", requests(fixture.transport, "turn/start")[1].params.effort)
+
+  fixture.session:select_model("gpt-5.6-terra")
+  h.eq("medium", fixture.session.reasoning_effort)
+  ok, err = fixture.session:select_reasoning("high")
+  h.falsy(ok)
+  h.matches("not supported", err.message)
+end)
+
 h.test("refreshes proposals after failed and interrupted turn completion", function()
   for _, status in ipairs({ "failed", "interrupted" }) do
     local fixture = h.session_fixture()
@@ -1255,6 +1310,8 @@ h.test("fake app-server supports authenticated and account-required startup", fu
   local authenticated = real_server_fixture("authenticated")
   authenticated.session:start()
   h.truthy(h.wait_for(function() return authenticated.session.state == "idle" end, 2000))
+  h.eq("gpt-5.6-sol", authenticated.session.model)
+  h.eq("low", authenticated.session.reasoning_effort)
   close_real_fixture(authenticated)
 
   local required = real_server_fixture("account-required")

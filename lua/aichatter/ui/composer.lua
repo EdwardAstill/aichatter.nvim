@@ -20,7 +20,7 @@ function Composer:_finish_submission(token, accepted)
   return accepted
 end
 
-function Composer:submit()
+function Composer:_submit(handler)
   if not valid_buffer(self) or self.pending then return false end
   local text = buffer_text(self)
   if vim.trim(text) == "" then return false end
@@ -32,7 +32,7 @@ function Composer:submit()
     callback_finished = true
     return self:_finish_submission(token, accepted ~= false)
   end
-  local ok, result = pcall(self.on_submit, text, complete)
+  local ok, result = pcall(handler, text, complete)
   if not ok then
     complete(false)
     return false
@@ -40,6 +40,14 @@ function Composer:submit()
   if token.finished then return token.accepted end
   if result == "pending" then return true end
   return complete(result ~= false)
+end
+
+function Composer:submit()
+  return self:_submit(self.on_submit)
+end
+
+function Composer:queue()
+  return self:_submit(self.on_queue)
 end
 
 function Composer:newline()
@@ -64,10 +72,16 @@ function Composer:newline()
   return true
 end
 
-function Composer:render(context)
+function Composer:render(context, metadata)
   if not valid_buffer(self) then return false end
   context = context or {}
+  metadata = metadata or {}
   vim.api.nvim_buf_clear_namespace(self.bufnr, self.namespace, 0, -1)
+  local virtual_lines = { {
+    { " Model: " .. tostring(metadata.model or "Codex default") .. "  ", "Comment" },
+    { "Reasoning: " .. tostring(metadata.reasoning or "Codex default") .. "  ", "Comment" },
+    { "Queued: " .. tostring(metadata.queued or 0) .. " ", "Comment" },
+  } }
   local chunks = {}
   for _, file in ipairs(context.files or {}) do
     chunks[#chunks + 1] = { "@" .. file .. "  ", "Comment" }
@@ -78,12 +92,11 @@ function Composer:render(context)
       "Comment",
     }
   end
-  if #chunks > 0 then
-    vim.api.nvim_buf_set_extmark(self.bufnr, self.namespace, 0, 0, {
-      virt_lines = { chunks },
-      virt_lines_above = true,
-    })
-  end
+  if #chunks > 0 then virtual_lines[#virtual_lines + 1] = chunks end
+  vim.api.nvim_buf_set_extmark(self.bufnr, self.namespace, 0, 0, {
+    virt_lines = virtual_lines,
+    virt_lines_above = true,
+  })
   return true
 end
 
@@ -105,7 +118,11 @@ function M.new(opts)
   opts = opts or {}
   local mappings = vim.tbl_extend("force", {
     submit = "<CR>",
+    submit_alt = "<M-CR>",
+    queue = "<Tab>",
     newline = "<C-j>",
+    model = "<M-m>",
+    reasoning = "<M-r>",
   }, opts.mappings or {})
   local bufnr = vim.api.nvim_create_buf(false, true)
   vim.bo[bufnr].buftype = "nofile"
@@ -117,14 +134,31 @@ function M.new(opts)
     winid = nil,
     namespace = vim.api.nvim_create_namespace("aichatter-composer-" .. bufnr),
     on_submit = opts.on_submit or function() end,
+    on_queue = opts.on_queue or function() end,
+    on_model = opts.on_model or function() end,
+    on_reasoning = opts.on_reasoning or function() end,
     pending = nil,
     closed = false,
   }, Composer)
   vim.keymap.set("i", "<Plug>(AIChatterComposerSubmit)", function() self:submit() end,
     { buffer = bufnr, silent = true })
+  vim.keymap.set("i", "<Plug>(AIChatterComposerQueue)", function() self:queue() end,
+    { buffer = bufnr, silent = true })
+  vim.keymap.set("i", "<Plug>(AIChatterComposerModel)", self.on_model,
+    { buffer = bufnr, silent = true })
+  vim.keymap.set("i", "<Plug>(AIChatterComposerReasoning)", self.on_reasoning,
+    { buffer = bufnr, silent = true })
   vim.keymap.set("i", "<Plug>(AIChatterComposerNewline)", function() self:newline() end,
     { buffer = bufnr, silent = true })
   vim.keymap.set("i", mappings.submit, "<Plug>(AIChatterComposerSubmit)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("i", mappings.submit_alt, "<Plug>(AIChatterComposerSubmit)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("i", mappings.queue, "<Plug>(AIChatterComposerQueue)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("i", mappings.model, "<Plug>(AIChatterComposerModel)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("i", mappings.reasoning, "<Plug>(AIChatterComposerReasoning)",
     { buffer = bufnr, silent = true, remap = true })
   vim.keymap.set("i", mappings.newline, "<Plug>(AIChatterComposerNewline)",
     { buffer = bufnr, silent = true, remap = true })

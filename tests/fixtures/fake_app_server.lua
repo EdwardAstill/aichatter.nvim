@@ -39,9 +39,14 @@ local function valid_thread_start(params)
 end
 
 local function valid_turn_start(params)
+  local effort_supported = params.model == "gpt-5.6-terra"
+      and params.effort == "medium"
+    or params.model == "gpt-5.6-sol"
+      and (params.effort == "low" or params.effort == "high")
   return params.threadId == thread_id
     and type(params.input) == "table"
     and params.sandboxPolicy == nil
+    and effort_supported
     and (scenario ~= "model-selection" or params.model == "gpt-5.6-terra")
 end
 
@@ -106,6 +111,7 @@ for line in io.lines() do
           defaultReasoningEffort = "low",
           supportedReasoningEfforts = {
             { reasoningEffort = "low", description = "Fast responses" },
+            { reasoningEffort = "high", description = "Deeper reasoning" },
           },
           inputModalities = { "text", "image" },
           supportsPersonality = true,

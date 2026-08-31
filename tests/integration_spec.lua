@@ -38,6 +38,16 @@ local function status_is(state)
   return winid and vim.wo[winid].statusline:find(state, 1, true) ~= nil
 end
 
+local function composer_metadata()
+  local bufnr = buffer("aichatter-composer")
+  if not bufnr then return "" end
+  local namespace = vim.api.nvim_get_namespaces()["aichatter-composer-" .. bufnr]
+  if not namespace then return "" end
+  local marks = vim.api.nvim_buf_get_extmarks(
+    bufnr, namespace, 0, -1, { details = true })
+  return #marks > 0 and vim.inspect(marks[1][4].virt_lines) or ""
+end
+
 local function session_root(temp_parent)
   local matches = vim.fn.glob(temp_parent .. "/aichatter-*", false, true)
   return #matches == 1 and matches[1] or nil
@@ -245,6 +255,34 @@ h.test("AIChatModel picker displays and selects an available model", function()
   vim.cmd("AIChatModel")
 
   h.truthy(h.wait_for(function() return status_is("gpt-5.6-terra") end, 3000))
+  h.matches("Model: gpt%-5%.6%-terra", composer_metadata())
+  h.matches("Reasoning: medium", composer_metadata())
+  vim.ui.select = old_select
+  close_chat()
+end)
+
+h.test("AIChatReasoning picker displays and uses a supported effort", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  local old_select = vim.ui.select
+  configure(root, "authenticated")
+  vim.cmd("AIChat")
+  h.truthy(h.wait_for(function()
+    return composer_metadata():find("Reasoning: low", 1, true) ~= nil
+  end, 5000))
+  vim.ui.select = function(items, opts, callback)
+    h.eq("Select AI Chatter reasoning", opts.prompt)
+    h.eq("low", items[1].reasoningEffort)
+    h.eq("high", items[2].reasoningEffort)
+    callback(items[2])
+  end
+
+  vim.cmd("AIChatReasoning")
+
+  h.truthy(h.wait_for(function()
+    return composer_metadata():find("Reasoning: high", 1, true) ~= nil
+  end, 3000))
+  submit("Use deeper reasoning")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
   vim.ui.select = old_select
   close_chat()
 end)

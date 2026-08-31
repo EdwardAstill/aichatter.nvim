@@ -8,6 +8,12 @@ local function dimensions(columns, lines, fn)
   assert(ok, err)
 end
 
+local function composer_metadata(ui)
+  local marks = vim.api.nvim_buf_get_extmarks(
+    ui.composer.bufnr, ui.composer.namespace, 0, -1, { details = true })
+  return #marks > 0 and vim.inspect(marks[1][4].virt_lines) or ""
+end
+
 h.test("creates transcript, changes, and 20 percent composer windows", function()
   dimensions(160, 50, function()
     local layout = require("aichatter.ui.layout").open({
@@ -144,16 +150,27 @@ h.test("opens file review in a centered float without replacing the editor buffe
   h.falsy(vim.api.nvim_win_is_valid(reopened_win))
 end)
 
-h.test("displays the selected model in the sidebar status line", function()
+h.test("displays model reasoning and queue count above the composer", function()
   local fixture = h.session_fixture({ files = {} })
   fixture.session.model = "gpt-5.6-sol"
+  fixture.session.reasoning_effort = "high"
+  local queued = 1
+  function fixture.session:queued_count() return queued end
   local ui = require("aichatter.ui").new(fixture.session, {})
   ui:open()
 
-  h.matches("gpt%-5%.6%-sol", vim.wo[ui.transcript.winid].statusline)
+  h.matches("Model: gpt%-5%.6%-sol", composer_metadata(ui))
+  h.matches("Reasoning: high", composer_metadata(ui))
+  h.matches("Queued: 1", composer_metadata(ui))
   fixture.session.model = "gpt-5.6-terra"
+  fixture.session.reasoning_effort = "medium"
+  queued = 2
   fixture.session:_emit("model", "gpt-5.6-terra")
-  h.matches("gpt%-5%.6%-terra", vim.wo[ui.transcript.winid].statusline)
+  fixture.session:_emit("reasoning", "medium")
+  fixture.session:_emit("queue", 2)
+  h.matches("Model: gpt%-5%.6%-terra", composer_metadata(ui))
+  h.matches("Reasoning: medium", composer_metadata(ui))
+  h.matches("Queued: 2", composer_metadata(ui))
 
   ui:close()
 end)

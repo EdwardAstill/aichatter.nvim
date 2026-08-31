@@ -47,11 +47,15 @@ h.test("rejects blank text and retains input when submission is rejected", funct
   composer:close()
 end)
 
-h.test("renders file and selection context chips above the composer", function()
+h.test("renders model reasoning queue and context above the composer", function()
   local composer = require("aichatter.ui.composer").new({})
   composer:render({
     files = { "lua/main.lua" },
     selections = { { path = "README.md", first = 3, last = 8 } },
+  }, {
+    model = "gpt-5.6-sol",
+    reasoning = "high",
+    queued = 2,
   })
   local marks = vim.api.nvim_buf_get_extmarks(
     composer.bufnr,
@@ -64,6 +68,9 @@ h.test("renders file and selection context chips above the composer", function()
   local details = marks[1][4]
   h.truthy(details.virt_lines_above)
   local rendered = vim.inspect(details.virt_lines)
+  h.matches("Model: gpt%-5%.6%-sol", rendered)
+  h.matches("Reasoning: high", rendered)
+  h.matches("Queued: 2", rendered)
   h.matches("@lua/main.lua", rendered)
   h.matches("README.md:3%-8", rendered)
   composer:close()
@@ -88,9 +95,37 @@ h.test("maps composer defaults through documented plug mappings", function()
   vim.api.nvim_set_current_buf(composer.bufnr)
 
   h.eq("<Plug>(AIChatterComposerSubmit)", vim.fn.maparg("<CR>", "i", false, true).rhs)
+  h.eq("<Plug>(AIChatterComposerSubmit)", vim.fn.maparg("<M-CR>", "i", false, true).rhs)
+  h.eq("<Plug>(AIChatterComposerQueue)", vim.fn.maparg("<Tab>", "i", false, true).rhs)
+  h.eq("<Plug>(AIChatterComposerModel)", vim.fn.maparg("<M-m>", "i", false, true).rhs)
+  h.eq("<Plug>(AIChatterComposerReasoning)", vim.fn.maparg("<M-r>", "i", false, true).rhs)
   h.eq("<Plug>(AIChatterComposerNewline)", vim.fn.maparg("<C-j>", "i", false, true).rhs)
   h.truthy(vim.fn.maparg("<Plug>(AIChatterComposerSubmit)", "i", false, true).callback ~= nil)
+  h.truthy(vim.fn.maparg("<Plug>(AIChatterComposerQueue)", "i", false, true).callback ~= nil)
+  h.truthy(vim.fn.maparg("<Plug>(AIChatterComposerModel)", "i", false, true).callback ~= nil)
+  h.truthy(vim.fn.maparg("<Plug>(AIChatterComposerReasoning)", "i", false, true).callback ~= nil)
   h.truthy(vim.fn.maparg("<Plug>(AIChatterComposerNewline)", "i", false, true).callback ~= nil)
+  composer:close()
+end)
+
+h.test("composer action keys invoke queue model and reasoning behavior", function()
+  local actions = {}
+  local composer = require("aichatter.ui.composer").new({
+    on_queue = function(text)
+      actions[#actions + 1] = "queue:" .. text
+    end,
+    on_model = function() actions[#actions + 1] = "model" end,
+    on_reasoning = function() actions[#actions + 1] = "reasoning" end,
+  })
+  vim.api.nvim_buf_set_lines(composer.bufnr, 0, -1, false, { "follow up" })
+  vim.api.nvim_set_current_buf(composer.bufnr)
+
+  vim.fn.maparg("<Plug>(AIChatterComposerModel)", "i", false, true).callback()
+  vim.fn.maparg("<Plug>(AIChatterComposerReasoning)", "i", false, true).callback()
+  vim.fn.maparg("<Plug>(AIChatterComposerQueue)", "i", false, true).callback()
+
+  h.eq({ "model", "reasoning", "queue:follow up" }, actions)
+  h.eq({ "" }, vim.api.nvim_buf_get_lines(composer.bufnr, 0, -1, false))
   composer:close()
 end)
 
@@ -136,8 +171,10 @@ h.test("composed UI clears context chips after an accepted session submission", 
     ui.composer.bufnr, ui.composer.namespace, 0, -1, {}))
   vim.api.nvim_buf_set_lines(ui.composer.bufnr, 0, -1, false, { "send this" })
   h.truthy(ui.composer:submit())
-  h.eq(0, #vim.api.nvim_buf_get_extmarks(
-    ui.composer.bufnr, ui.composer.namespace, 0, -1, {}))
+  local marks = vim.api.nvim_buf_get_extmarks(
+    ui.composer.bufnr, ui.composer.namespace, 0, -1, { details = true })
+  h.eq(1, #marks)
+  h.falsy(vim.inspect(marks[1][4].virt_lines):find("@lua/main.lua", 1, true))
   ui:close()
 end)
 
