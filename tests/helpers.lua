@@ -65,6 +65,16 @@ function M.read(path)
   return bytes
 end
 
+function M.read_optional(path)
+  local file = io.open(path, "rb")
+  if not file then
+    return nil
+  end
+  local bytes = file:read("*a")
+  file:close()
+  return bytes
+end
+
 function M.write(path, bytes)
   local file = assert(io.open(path, "wb"))
   file:write(bytes)
@@ -81,6 +91,101 @@ end
 
 function M.chmod(path, mode)
   assert(vim.uv.fs_chmod(path, mode))
+end
+
+function M.mode(path)
+  local stat = assert(vim.uv.fs_stat(path))
+  return bit.band(stat.mode, 511)
+end
+
+function M.assert_no_error(err)
+  assert(err == nil, vim.inspect(err))
+end
+
+function M.load_buffer(filename, lines, modified)
+  local bufnr = vim.fn.bufadd(filename)
+  vim.fn.bufload(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  vim.bo[bufnr].modified = modified
+  return bufnr
+end
+
+function M.await(invoke)
+  local calls = 0
+  local values
+  invoke(function(...)
+    calls = calls + 1
+    values = { ... }
+  end)
+  assert(M.wait_for(function() return calls > 0 end, 3000), "timed out waiting for callback")
+  vim.wait(20)
+  return values and unpack(values) or nil, calls
+end
+
+function M.review_fixture(base_bytes, candidate_bytes, opts)
+  opts = opts or {}
+  local baseline_root = M.tempdir()
+  local workspace_root = M.tempdir()
+  local live_root = M.tempdir()
+  local relative = opts.path or "main.txt"
+
+  local function replace(root, bytes)
+    local filename = root .. "/" .. relative
+    if bytes == nil then
+      vim.fn.delete(filename)
+      return
+    end
+    M.mkdir(vim.fs.dirname(filename))
+    M.write(filename, bytes)
+  end
+
+  replace(baseline_root, base_bytes)
+  replace(workspace_root, candidate_bytes)
+  replace(live_root, opts.live_bytes == nil and base_bytes or opts.live_bytes)
+  if opts.base_mode and base_bytes ~= nil then
+    M.chmod(baseline_root .. "/" .. relative, opts.base_mode)
+  end
+  if opts.candidate_mode and candidate_bytes ~= nil then
+    M.chmod(workspace_root .. "/" .. relative, opts.candidate_mode)
+  end
+  if opts.live_mode and M.read_optional(live_root .. "/" .. relative) ~= nil then
+    M.chmod(live_root .. "/" .. relative, opts.live_mode)
+  end
+
+  local Live = require("aichatter.live")
+  local Review = require("aichatter.review")
+  local live = Live.new(live_root)
+  local live_write_count = 0
+  local original_write = live.write
+  function live:write(...)
+    live_write_count = live_write_count + 1
+    return original_write(self, ...)
+  end
+  local review = Review.new({
+    baseline_root = baseline_root,
+    workspace_root = workspace_root,
+    live = live,
+  })
+  local refresh_err, refresh_calls = M.await(function(callback)
+    review:refresh(callback)
+  end)
+  assert(refresh_err == nil, vim.inspect(refresh_err))
+  assert(refresh_calls == 1, "refresh callback called more than once")
+
+  return {
+    baseline_root = baseline_root,
+    workspace_root = workspace_root,
+    live_root = live_root,
+    relative = relative,
+    live = live,
+    review = review,
+    baseline_bytes = function() return M.read_optional(baseline_root .. "/" .. relative) end,
+    workspace_bytes = function() return M.read_optional(workspace_root .. "/" .. relative) end,
+    live_bytes = function() return live:read(relative) end,
+    set_live = function(bytes) replace(live_root, bytes) end,
+    set_workspace = function(bytes) replace(workspace_root, bytes) end,
+    live_write_count = function() return live_write_count end,
+  }
 end
 
 local function git(root, ...)
