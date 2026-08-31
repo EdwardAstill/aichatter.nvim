@@ -80,6 +80,13 @@ The plugin installs no mandatory global mappings. Its defaults are buffer-local:
 - Hunk review: `[c`/`]c` move between pending hunks, `a` accepts, `r` rejects,
   and `e` edits the complete candidate in an `acwrite` buffer.
 
+Each default forwards through a buffer-local `<Plug>` mapping, so custom
+mappings can reuse the plugin action: `AIChatterComposerSubmit`,
+`AIChatterComposerNewline`, `AIChatterChangesOpen`, `AIChatterChangesAccept`,
+`AIChatterChangesReject`, `AIChatterReviewPreviousHunk`,
+`AIChatterReviewNextHunk`, `AIChatterReviewAccept`, `AIChatterReviewReject`,
+and `AIChatterReviewEdit`.
+
 ## Safety and unsaved buffers
 
 Each session creates a protected baseline and writable workspace under one

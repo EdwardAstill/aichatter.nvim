@@ -1,5 +1,6 @@
 local default_fs = require("aichatter.fs")
 local default_path = require("aichatter.path")
+local buffer = require("aichatter.buffer")
 
 local function once(callback)
   local called = false
@@ -24,7 +25,6 @@ local function new(dependencies)
   local fs = dependencies.fs or default_fs
   local path = dependencies.path or default_path
   local uv = dependencies.uv or vim.uv or vim.loop
-  local session_counter = 0
   local Shadow = {}
   Shadow.__index = Shadow
 
@@ -56,17 +56,10 @@ local function new(dependencies)
         local under_alias = root_alias and name ~= root_alias
           and path.is_within(root_alias, name)
         if under_root or under_alias then
-          local bytes = table.concat(
-            vim.api.nvim_buf_get_lines(bufnr, 0, -1, false),
-            "\n"
-          )
-          if vim.bo[bufnr].endofline then
-            bytes = bytes .. "\n"
-          end
           local stat = uv.fs_stat(name)
           buffers[#buffers + 1] = {
             path = name,
-            bytes = bytes,
+            bytes = buffer.bytes(bufnr),
             mode = stat and bit.band(stat.mode, 511) or 420,
           }
         end
@@ -94,11 +87,20 @@ local function new(dependencies)
     }
   end
 
-  local function mkdir(target)
-    local made, err, code = uv.fs_mkdir(target, 493)
+  local function mkdir(target, mode)
+    local made, err, code = uv.fs_mkdir(target, mode or 493)
     if not made then
       return { code = code, message = string.format("mkdir %s: %s", target, err or "unknown error") }
     end
+  end
+
+  local function stat_identity(stat)
+    return stat and { dev = stat.dev, ino = stat.ino } or nil
+  end
+
+  local function same_identity(left, right)
+    return left and right and left.dev ~= nil and left.ino ~= nil
+      and left.dev == right.dev and left.ino == right.ino
   end
 
   local function real_project_root(target)
@@ -123,23 +125,63 @@ local function new(dependencies)
     return real
   end
 
+  local function random_hex()
+    local random = dependencies.random or uv.random
+    if type(random) ~= "function" then
+      return nil, { code = "unsupported", message = "secure random allocation is unavailable" }
+    end
+    local ok, bytes, err = pcall(random, 18)
+    if not ok or type(bytes) ~= "string" or #bytes ~= 18 then
+      return nil, {
+        code = "random_failed",
+        message = "could not allocate secure random session bytes: " .. tostring(err or bytes),
+      }
+    end
+    return (bytes:gsub(".", function(byte) return string.format("%02x", string.byte(byte)) end))
+  end
+
+  local function canonical_temp_parent(value)
+    local real, err, code = uv.fs_realpath(value)
+    if not real then
+      return nil, nil, { code = code, message = string.format(
+        "realpath %s: %s", value, err or "unknown error") }
+    end
+    real = path.normalize(real)
+    local stat, stat_err, stat_code = uv.fs_lstat(real)
+    if not stat then
+      return nil, nil, { code = stat_code, message = string.format(
+        "lstat %s: %s", real, stat_err or "unknown error") }
+    end
+    if stat.type ~= "directory" then
+      return nil, nil, { message = "temporary parent is not a directory: " .. real }
+    end
+    return real, stat_identity(stat)
+  end
+
   local function create_session_root(temp_parent)
     for _ = 1, 100 do
-      session_counter = session_counter + 1
-      local candidate = path.join(temp_parent, string.format(
-        "aichatter-%d-%d",
-        uv.os_getpid(),
-        session_counter
-      ))
-      local err = mkdir(candidate)
+      local suffix, random_err = random_hex()
+      if not suffix then return nil, nil, random_err end
+      local candidate = path.join(temp_parent, "aichatter-" .. suffix)
+      local err = mkdir(candidate, 448)
       if not err then
-        return candidate
+        local stat, stat_err, stat_code = uv.fs_lstat(candidate)
+        if not stat then
+          return nil, nil, {
+            code = stat_code,
+            message = string.format("lstat %s: %s", candidate, stat_err or "unknown error"),
+          }
+        end
+        if stat.type ~= "directory" or bit.band(stat.mode, 511) ~= 448 then
+          return nil, nil, { message = "allocated session root is not a private directory" }
+        end
+        return candidate, stat_identity(stat)
       end
       if err.code ~= "EEXIST" then
         return nil, err
       end
     end
-    return nil, { message = "could not allocate a unique aichatter session directory" }
+    return nil, nil, { message = "could not allocate a unique aichatter session directory" }
   end
 
   function Shadow:_finish_activity(cancel)
@@ -189,6 +231,10 @@ local function new(dependencies)
       fs.remove_tree_guarded,
       self.session_root,
       self._temp_parent,
+      {
+        identity = self._session_identity,
+        parent_identity = self._temp_parent_identity,
+      },
       once(function(err)
         self._cleanup_error = err
         self._cleanup_done = true
@@ -319,25 +365,65 @@ local function new(dependencies)
     self:_overlay_buffers({}, callback or function() end)
   end
 
+  function Shadow:validate_grant_root(value)
+    local grant = value
+    if grant == nil or grant == vim.NIL then grant = self.workspace_root end
+    if type(grant) ~= "string" then
+      return false, { code = "invalid_grant", message = "file approval grant root is invalid" }
+    end
+    local ok, absolute = pcall(path.normalize, grant, self.workspace_root)
+    if not ok or (absolute ~= self.workspace_root
+      and not path.is_within(self.workspace_root, absolute)) then
+      return false, { code = "outside_shadow", message = "file approval grant is outside shadow" }
+    end
+    local session = uv.fs_lstat(self.session_root)
+    local parent = uv.fs_lstat(self._temp_parent)
+    if not session or session.type ~= "directory"
+      or not same_identity(session, self._session_identity)
+      or not parent or parent.type ~= "directory"
+      or not same_identity(parent, self._temp_parent_identity) then
+      return false, { code = "shadow_changed", message = "disposable shadow identity changed" }
+    end
+    local current = self.workspace_root
+    local workspace = uv.fs_lstat(current)
+    if not workspace or workspace.type ~= "directory"
+      or not same_identity(workspace, self._workspace_identity) then
+      return false, { code = "shadow_changed", message = "workspace identity changed" }
+    end
+    local relative = path.relative(self.workspace_root, absolute)
+    if relative ~= "." then
+      for component in relative:gmatch("[^/]+") do
+        current = current .. "/" .. component
+        local stat = uv.fs_lstat(current)
+        if not stat or stat.type ~= "directory" then
+          return false, { code = "unsafe_grant", message = "grant path is not a no-follow directory" }
+        end
+      end
+    end
+    return true, absolute
+  end
+
   local function normalized_exclusions(project_root, root_alias, exclude_paths)
     local result = { [".git"] = true }
     for value, excluded in pairs(exclude_paths or {}) do
       if excluded then
-        local relative = value
+        if type(value) ~= "string" then
+          return nil, { code = "invalid_path", message = "excluded path must be a string" }
+        end
+        local absolute
         if value:sub(1, 1) == "/" then
-          local absolute = translate_root_alias(project_root, root_alias, value)
-          if path.is_within(project_root, absolute) and absolute ~= project_root then
-            relative = path.relative(project_root, absolute)
-          else
-            relative = nil
-          end
+          absolute = translate_root_alias(project_root, root_alias, value)
         else
-          relative = value:gsub("^%./", "")
+          local ok, normalized = pcall(path.normalize, value, project_root)
+          if not ok then
+            return nil, { code = "invalid_path", message = tostring(normalized) }
+          end
+          absolute = normalized
         end
-        if relative and relative ~= "" and relative ~= "."
-          and relative ~= ".." and relative:sub(1, 3) ~= "../" then
-          result[relative] = true
+        if absolute == project_root or not path.is_within(project_root, absolute) then
+          return nil, { code = "outside_root", message = "excluded path escapes project root: " .. value }
         end
+        result[path.relative(project_root, absolute)] = true
       end
     end
     return result
@@ -349,11 +435,12 @@ local function new(dependencies)
       callback({ code = "cancelled", message = "shadow work cancelled" })
       return
     end
-    local exclude = normalized_exclusions(
+    local exclude, exclude_err = normalized_exclusions(
       self.project_root,
       self._root_alias,
       exclude_paths
     )
+    if not exclude then callback(exclude_err); return end
     self:_copy(self.project_root, self.workspace_root, {
       exclude = exclude,
       overlay = true,
@@ -399,8 +486,10 @@ local function new(dependencies)
       callback(root_err)
       return
     end
-    local temp_parent = path.normalize(assert(opts.temp_parent, "temp_parent is required"))
-    local session_root, session_err = create_session_root(temp_parent)
+    local requested_temp_parent = path.normalize(assert(opts.temp_parent, "temp_parent is required"))
+    local temp_parent, temp_parent_identity, temp_err = canonical_temp_parent(requested_temp_parent)
+    if not temp_parent then callback(temp_err); return end
+    local session_root, session_identity, session_err = create_session_root(temp_parent)
     if not session_root then
       callback(session_err)
       return
@@ -412,6 +501,8 @@ local function new(dependencies)
       project_root = root,
       _root_alias = root_alias,
       _temp_parent = temp_parent,
+      _temp_parent_identity = temp_parent_identity,
+      _session_identity = session_identity,
       _buffer_provider = opts.buffer_provider or default_buffer_provider,
       _active = 0,
       _cancels = {},
@@ -422,7 +513,18 @@ local function new(dependencies)
     }, Shadow)
     local run = opts.run or dependencies.run or default_run
 
-    local function fail(err)
+    local fail
+    local function complete()
+      local workspace, workspace_err, workspace_code = uv.fs_lstat(self.workspace_root)
+      if not workspace or workspace.type ~= "directory" then
+        fail({ code = workspace_code, message = workspace_err or "workspace is not a directory" })
+        return
+      end
+      self._workspace_identity = stat_identity(workspace)
+      callback(nil, self)
+    end
+
+    fail = function(err)
       self:cleanup(function()
         callback(err)
       end)
@@ -455,7 +557,7 @@ local function new(dependencies)
             if buffer_err then
               fail(buffer_err)
             else
-              callback(nil, self)
+              complete()
             end
           end)
         end)
@@ -488,7 +590,7 @@ local function new(dependencies)
                 if buffer_err then
                   fail(buffer_err)
                 else
-                  callback(nil, self)
+                  complete()
                 end
               end)
             end)

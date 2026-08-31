@@ -203,6 +203,25 @@ for line in io.lines() do
           created:close()
           os.exit(23)
         end
+      elseif scenario == "crash-after-write" then
+        local marker = crash_marker()
+        local existing = io.open(marker, "rb")
+        if existing then
+          existing:close()
+          write_file(thread_cwd .. "/main.lua", "followup\n")
+          notify("item/agentMessage/delta", {
+            threadId = thread_id,
+            turnId = turn_id,
+            delta = "follow-up proposal",
+          })
+          complete("completed")
+        else
+          write_file(thread_cwd .. "/main.lua", "partial\n")
+          local created = assert(io.open(marker, "wb"))
+          created:write("crashed after write\n")
+          created:close()
+          os.exit(23)
+        end
       elseif scenario == "wait-for-cancel" then
         notify("item/agentMessage/delta", {
           threadId = thread_id,

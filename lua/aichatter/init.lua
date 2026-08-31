@@ -30,12 +30,12 @@ local function create_instance()
 end
 
 local function start(active, callback)
-  if active.session.state ~= "closed" then
+  if active.session.state ~= "closed" and active.session.state ~= "failed" then
     callback()
     return
   end
   active.session:start(function(err)
-    if err then notify_error(err) end
+    if err and not active.session.disposed then notify_error(err) end
     callback(err)
   end)
 end
@@ -112,7 +112,11 @@ end
 
 function M.toggle()
   local active = create_instance()
-  active.ui:toggle()
+  if active.session.state == "failed" then
+    active.ui:open()
+  else
+    active.ui:toggle()
+  end
   start(active, function() end)
 end
 

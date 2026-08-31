@@ -1,6 +1,7 @@
 local default_diff = require("aichatter.diff")
 local default_fs = require("aichatter.fs")
 local default_path = require("aichatter.path")
+local buffer = require("aichatter.buffer")
 
 local function require_callback(callback)
   assert(type(callback) == "function", "callback function is required")
@@ -125,7 +126,8 @@ local function new(dependencies)
       end
       local final = index == #parts
       if stat.type == "link" then
-        return nil, failure(final and "symlink" or "symlink_ancestor", "symlink in live path: " .. current)
+        if final then return stat end
+        return nil, failure("symlink_ancestor", "symlink in live path: " .. current)
       elseif not final and stat.type ~= "directory" then
         return nil, failure("not_directory", "non-directory ancestor: " .. current)
       elseif final and stat.type ~= "file" then
@@ -177,15 +179,28 @@ local function new(dependencies)
     return result
   end
 
-  local function buffer_bytes(bufnr)
-    local bytes = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-    return vim.bo[bufnr].endofline and bytes .. "\n" or bytes
-  end
-
   function Live:_disk_snapshot(absolute)
     local before, inspect_err = self:_inspect(absolute)
     if inspect_err then return nil, inspect_err end
     if not before then return { exists = false, disk_exists = false } end
+    if before.type == "link" then
+      local target, target_err, target_code = uv.fs_readlink(absolute)
+      if not target then return nil, failure(target_code, target_err or "could not read link") end
+      local after, after_err = self:_inspect(absolute)
+      if after_err then return nil, after_err end
+      local after_target = after and uv.fs_readlink(absolute)
+      if not after or after.type ~= "link" or not same_identity(before, after)
+        or after_target ~= target then
+        return nil, failure("changed", "live link changed while reading")
+      end
+      return {
+        exists = true,
+        disk_exists = true,
+        kind = "link",
+        target = target,
+        identity = identity(after),
+      }
+    end
     local fd, open_err, open_code = uv.fs_open(absolute, open_flags(), 0)
     if not fd then return nil, failure(open_code, open_err or "could not open " .. absolute) end
     local chunks = {}
@@ -215,6 +230,7 @@ local function new(dependencies)
     return {
       exists = true,
       disk_exists = true,
+      kind = "file",
       bytes = bytes,
       disk_bytes = bytes,
       mode = bit.band(after.mode, 511),
@@ -227,12 +243,14 @@ local function new(dependencies)
     if not absolute then return nil, resolve_err end
     local disk, disk_err = self:_disk_snapshot(absolute)
     if disk_err then return nil, disk_err end
+    if disk.kind == "link" then return disk end
     local bufnr = self:_loaded_buffer(absolute)
     if not bufnr then return disk end
-    local ok, bytes = pcall(buffer_bytes, bufnr)
+    local ok, bytes = pcall(buffer.bytes, bufnr)
     if not ok then return nil, error_value(bytes) end
     return {
       exists = true,
+      kind = "file",
       disk_exists = disk.disk_exists,
       disk_bytes = disk.disk_bytes,
       bytes = bytes,
@@ -249,7 +267,14 @@ local function new(dependencies)
   end
 
   local function matches(expected, current)
-    if expected.exists ~= current.exists or expected.bytes ~= current.bytes or expected.mode ~= current.mode then
+    local expected_kind = expected.kind or (expected.exists and "file" or nil)
+    local current_kind = current.kind or (current.exists and "file" or nil)
+    if expected.exists ~= current.exists or expected_kind ~= current_kind then
+      return false
+    end
+    if expected_kind == "link" then
+      if expected.target ~= current.target then return false end
+    elseif expected.bytes ~= current.bytes or expected.mode ~= current.mode then
       return false
     end
     if expected.disk_exists ~= nil and (expected.disk_exists ~= current.disk_exists
@@ -277,6 +302,9 @@ local function new(dependencies)
   function Live:read(relative)
     local snapshot, err = self:snapshot(relative)
     if not snapshot then return nil, err end
+    if snapshot.kind == "link" then
+      return nil, failure("not_file", "live path is a symlink")
+    end
     return snapshot.exists and snapshot.bytes or nil
   end
 
@@ -343,11 +371,15 @@ local function new(dependencies)
       callback(resolve_err)
       return
     end
-    local bufnr = self:_loaded_buffer(absolute)
+    local current, current_err = self:snapshot(relative)
+    if not current then
+      callback = require_callback(callback)
+      callback(current_err)
+      return
+    end
+    local bufnr = current.kind ~= "link" and current.bufnr or nil
     if bufnr then
       callback = optional_callback(callback)
-      local current, current_err = self:snapshot(relative)
-      if not current then callback(current_err); return end
       if expected and not matches(expected, current) then
         callback(failure("conflict", "live buffer changed after validation")); return
       end
@@ -383,13 +415,32 @@ local function new(dependencies)
     end
 
     callback = require_callback(callback)
-    local current, current_err = self:snapshot(relative)
-    if not current then callback(current_err); return end
     if expected and not matches(expected, current) then
       callback(failure("conflict", "live file changed after validation")); return
     end
     expected = expected or current
     local ok, thrown = pcall(fs.atomic_write, absolute, bytes, mode, {
+      before_commit = function() return self:_validate_expected(relative, expected) end,
+    }, callback)
+    if not ok then callback(error_value(thrown)) end
+  end
+
+  function Live:write_link(relative, target, expected, callback)
+    expected, callback = parse_guard(expected, callback)
+    callback = require_callback(callback)
+    if type(target) ~= "string" then
+      callback(failure("invalid_target", "symlink target must be a string"))
+      return
+    end
+    local absolute, resolve_err = self:_resolve(relative)
+    if not absolute then callback(resolve_err); return end
+    local current, current_err = self:snapshot(relative)
+    if not current then callback(current_err); return end
+    if expected and not matches(expected, current) then
+      callback(failure("conflict", "live link changed after validation")); return
+    end
+    expected = expected or current
+    local ok, thrown = pcall(fs.atomic_symlink, absolute, target, {
       before_commit = function() return self:_validate_expected(relative, expected) end,
     }, callback)
     if not ok then callback(error_value(thrown)) end
@@ -403,15 +454,14 @@ local function new(dependencies)
       callback(resolve_err)
       return
     end
-    local bufnr = self:_loaded_buffer(absolute)
-    if bufnr and vim.bo[bufnr].modified then
-      callback = optional_callback(callback)
-      callback(failure("modified_buffer", "refusing to delete a modified loaded buffer"))
-      return
-    end
     callback = require_callback(callback)
     local current, current_err = self:snapshot(relative)
     if not current then callback(current_err); return end
+    local bufnr = current.kind ~= "link" and current.bufnr or nil
+    if bufnr and vim.bo[bufnr].modified then
+      callback(failure("modified_buffer", "refusing to delete a modified loaded buffer"))
+      return
+    end
     if expected and not matches(expected, current) then
       callback(failure("conflict", "live path changed after validation")); return
     end
@@ -452,7 +502,9 @@ local function new(dependencies)
       callback(failure("conflict", "live path changed before rollback"))
       return
     end
-    if before.bufnr then
+    if before.kind == "link" then
+      self:write_link(relative, before.target, current, callback)
+    elseif before.bufnr then
       if current.bufnr ~= before.bufnr or not vim.api.nvim_buf_is_valid(before.bufnr)
         or not vim.api.nvim_buf_is_loaded(before.bufnr) then
         callback(failure("rollback_unavailable", "original loaded buffer no longer exists"))

@@ -1,4 +1,5 @@
 local diff = require("aichatter.diff")
+local buffer = require("aichatter.buffer")
 
 local View = {}
 View.__index = View
@@ -18,18 +19,17 @@ local function range(start, count)
   return string.format("%d,%d", count == 0 and start or start + 1, count)
 end
 
-local function buffer_bytes(bufnr)
-  local bytes = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-  if vim.bo[bufnr].endofline then bytes = bytes .. "\n" end
-  return bytes
-end
-
 local function actionable(hunk)
   return hunk.status ~= "accepted" and hunk.status ~= "rejected"
 end
 
 function View:_notify(err)
   self.notify(error_message(err), vim.log.levels.ERROR, { title = "aichatter.nvim" })
+end
+
+function View:_review_action(method, ...)
+  if self.on_action then return self.on_action(method, ...) end
+  return self.review[method](self.review, ...)
 end
 
 function View:_append(lines, value, hunk)
@@ -81,8 +81,15 @@ function View:render(preferred_hunk)
 
   if not record then
     lines[#lines + 1] = "(proposal resolved)"
-  elseif record.binary or record.file_level then
+  elseif record.binary then
     lines[#lines + 1] = "(whole-file review required)"
+  elseif record.file_level then
+    for _, hunk in ipairs(record.hunks or {}) do
+      self:_render_hunk(lines, record, hunk)
+    end
+    if #(record.hunks or {}) == 0 then
+      lines[#lines + 1] = "(whole-file review required)"
+    end
   else
     for _, hunk in ipairs(record.hunks or {}) do
       self:_render_hunk(lines, record, hunk)
@@ -133,7 +140,8 @@ function View:_sync_candidate()
   if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
   local record = self.record
   if vim.bo[bufnr].modified then
-    if record and not record.binary and buffer_bytes(bufnr) == (record.candidate or "") then
+    if record and not record.binary
+        and buffer.bytes(bufnr, { empty_is_zero = true }) == (record.candidate or "") then
       vim.b[bufnr].aichatter_stale = nil
       vim.api.nvim_buf_clear_namespace(bufnr, self.candidate_namespace, 0, -1)
     else
@@ -186,10 +194,20 @@ function View:_move(direction)
 end
 
 function View:_decide(method)
+  if self.record and self.record.file_level then
+    local file_method = method == "accept_hunk" and "accept_file" or "reject_file"
+    self:_review_action(file_method, self.path, function(err)
+      if self.closed then return end
+      self:reconcile()
+      self.on_change()
+      if err then self:_notify(err) end
+    end)
+    return
+  end
   local hunk = self:_current_hunk()
   if not hunk then return end
   local id = hunk.id
-  self.review[method](self.review, self.path, id, function(err)
+  self:_review_action(method, self.path, id, function(err)
     if self.closed then return end
     self:reconcile(id)
     self.on_change()
@@ -225,12 +243,12 @@ function View:_open_candidate()
       self.candidate_writing = true
       local generation = self.generation
       local origin_win = self.winid
-      local bytes = buffer_bytes(bufnr)
-      self.review:edit_candidate(self.path, bytes, function(err)
+      local bytes = buffer.bytes(bufnr, { empty_is_zero = true })
+      self:_review_action("edit_candidate", self.path, bytes, function(err)
         self.candidate_writing = false
         if self.closed or not vim.api.nvim_buf_is_valid(bufnr) then return end
         if err then self:_notify(err); return end
-        local unchanged = buffer_bytes(bufnr) == bytes
+        local unchanged = buffer.bytes(bufnr, { empty_is_zero = true }) == bytes
         if unchanged then vim.bo[bufnr].modified = false end
         self:reconcile()
         self.on_change()
@@ -296,19 +314,30 @@ function M.open(review, relative, opts)
     context_lines = opts.context_lines or 3,
     notify = opts.notify or vim.notify,
     on_change = opts.on_change or function() end,
+    on_action = opts.on_action,
     generation = 1,
     closed = false,
   }, View)
-  vim.keymap.set("n", mappings.previous_hunk, function() self:_move(-1) end,
+  vim.keymap.set("n", "<Plug>(AIChatterReviewPreviousHunk)", function() self:_move(-1) end,
     { buffer = bufnr, silent = true })
-  vim.keymap.set("n", mappings.next_hunk, function() self:_move(1) end,
+  vim.keymap.set("n", "<Plug>(AIChatterReviewNextHunk)", function() self:_move(1) end,
     { buffer = bufnr, silent = true })
-  vim.keymap.set("n", mappings.accept, function() self:_decide("accept_hunk") end,
+  vim.keymap.set("n", "<Plug>(AIChatterReviewAccept)", function() self:_decide("accept_hunk") end,
     { buffer = bufnr, silent = true })
-  vim.keymap.set("n", mappings.reject, function() self:_decide("reject_hunk") end,
+  vim.keymap.set("n", "<Plug>(AIChatterReviewReject)", function() self:_decide("reject_hunk") end,
     { buffer = bufnr, silent = true })
-  vim.keymap.set("n", mappings.edit, function() self:_open_candidate() end,
+  vim.keymap.set("n", "<Plug>(AIChatterReviewEdit)", function() self:_open_candidate() end,
     { buffer = bufnr, silent = true })
+  vim.keymap.set("n", mappings.previous_hunk, "<Plug>(AIChatterReviewPreviousHunk)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("n", mappings.next_hunk, "<Plug>(AIChatterReviewNextHunk)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("n", mappings.accept, "<Plug>(AIChatterReviewAccept)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("n", mappings.reject, "<Plug>(AIChatterReviewReject)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("n", mappings.edit, "<Plug>(AIChatterReviewEdit)",
+    { buffer = bufnr, silent = true, remap = true })
   self:render()
   return self
 end

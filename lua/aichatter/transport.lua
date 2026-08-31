@@ -31,7 +31,10 @@ function Transport:_reset_parser()
   self.parser = jsonl.new(function(message)
     self:_dispatch(message)
   end, function(err, line)
-    self.last_error = { message = err, line = line }
+    self:_emit_diagnostic("malformed_json", "malformed JSON from app-server", {
+      detail = err,
+      line = line,
+    })
   end)
 end
 
@@ -48,15 +51,45 @@ function Transport:_write(message)
   return true
 end
 
+function Transport:_emit_diagnostic(code, message, extra)
+  local diagnostic = vim.tbl_extend("force", {
+    code = code,
+    message = message,
+  }, extra or {})
+  self.last_error = diagnostic
+  local listeners = self.listeners.error
+  if not listeners then return end
+  for _, listener in ipairs(vim.list_slice(listeners)) do
+    local ok, err = pcall(listener, diagnostic)
+    if not ok then
+      self.last_emit_error = {
+        code = "listener_error",
+        method = "error",
+        message = tostring(err),
+      }
+    end
+  end
+end
+
 function Transport:_emit(method, params, id)
   local listeners = self.listeners[method]
   if not listeners then
-    return
+    return false
   end
 
-  for _, listener in ipairs(listeners) do
-    listener(params, id)
+  local delivered = false
+  for _, listener in ipairs(vim.list_slice(listeners)) do
+    delivered = true
+    local ok, err = pcall(listener, params, id)
+    if not ok then
+      self:_emit_diagnostic("listener_error",
+        "listener for " .. tostring(method) .. " failed: " .. tostring(err), {
+          method = method,
+          detail = tostring(err),
+        })
+    end
   end
+  return delivered
 end
 
 function Transport:_dispatch(message)
@@ -65,18 +98,43 @@ function Transport:_dispatch(message)
     self.pending[message.id] = nil
     if callback then
       callback(message.error, message.result)
+    else
+      self:_emit_diagnostic("unknown_response",
+        "received response for an unknown request", {
+          id = message.id,
+          error = message.error,
+          result = message.result,
+        })
     end
     return
   end
 
   if message.id and message.method then
-    self:_emit(message.method, message.params, message.id)
+    if not self:_emit(message.method, message.params, message.id) then
+      self:_emit_diagnostic("unknown_notification",
+        "received request for an unknown method", {
+          id = message.id,
+          method = message.method,
+          params = message.params,
+        })
+    end
     return
   end
 
   if message.method then
-    self:_emit(message.method, message.params)
+    if not self:_emit(message.method, message.params) then
+      self:_emit_diagnostic("unknown_notification",
+        "received notification for an unknown method", {
+          method = message.method,
+          params = message.params,
+        })
+    end
+    return
   end
+
+  self:_emit_diagnostic("unknown_message", "received unrecognized app-server frame", {
+    frame = message,
+  })
 end
 
 function Transport:_reject_pending(err)

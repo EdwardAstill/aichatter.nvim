@@ -39,6 +39,74 @@ local function failing_fs(fail_at)
   }, { __index = real })
 end
 
+local function link_review_fixture(base_target, candidate_target, live_target)
+  local baseline_root, workspace_root, live_root = h.tempdir(), h.tempdir(), h.tempdir()
+  local relative = "link"
+  local function replace(root, target)
+    local filename = root .. "/" .. relative
+    if vim.uv.fs_lstat(filename) then assert(vim.uv.fs_unlink(filename)) end
+    if target ~= nil then h.symlink(target, filename) end
+  end
+  replace(baseline_root, base_target)
+  replace(workspace_root, candidate_target)
+  replace(live_root, live_target)
+  local Review = require("aichatter.review")
+  local Live = require("aichatter.live")
+  local review = Review.new({
+    baseline_root = baseline_root,
+    workspace_root = workspace_root,
+    live = Live.new(live_root),
+  })
+  h.eq(nil, call(function(callback) review:refresh(callback) end))
+  return {
+    review = review,
+    baseline_root = baseline_root,
+    workspace_root = workspace_root,
+    live_root = live_root,
+    readlink = function(root)
+      return vim.uv.fs_lstat(root .. "/" .. relative)
+        and vim.uv.fs_readlink(root .. "/" .. relative) or nil
+    end,
+  }
+end
+
+h.test("reviews unchanged created modified and deleted internal and external links", function()
+  local outside = h.tempdir()
+  h.write(outside .. "/old", "outside old\n")
+  h.write(outside .. "/new", "outside new\n")
+  for label, targets in pairs({
+    internal = { old = "old.txt", new = "new.txt" },
+    external = { old = outside .. "/old", new = outside .. "/new" },
+  }) do
+    local unchanged = link_review_fixture(targets.old, targets.old, targets.old)
+    h.eq(0, #unchanged.review:files())
+
+    local created = link_review_fixture(nil, targets.new, nil)
+    h.eq("link", created.review:files()[1].candidate_kind)
+    h.eq(nil, action(created, "accept_file", "link"), label .. " created")
+    h.eq(targets.new, created.readlink(created.live_root))
+    h.eq(targets.new, created.readlink(created.baseline_root))
+
+    local modified = link_review_fixture(targets.old, targets.new, targets.old)
+    h.eq("link", modified.review:files()[1].base_kind)
+    h.eq(nil, action(modified, "accept_file", "link"), label .. " modified")
+    h.eq(targets.new, modified.readlink(modified.live_root))
+    h.eq(targets.new, modified.readlink(modified.baseline_root))
+
+    local deleted = link_review_fixture(targets.old, nil, targets.old)
+    h.eq(nil, action(deleted, "accept_file", "link"), label .. " deleted")
+    h.eq(nil, deleted.readlink(deleted.live_root))
+    h.eq(nil, deleted.readlink(deleted.baseline_root))
+
+    local rejected = link_review_fixture(targets.old, targets.new, targets.old)
+    h.eq(nil, action(rejected, "reject_file", "link"), label .. " rejected")
+    h.eq(targets.old, rejected.readlink(rejected.workspace_root))
+    h.eq(targets.old, rejected.readlink(rejected.live_root))
+  end
+  h.eq("outside old\n", h.read(outside .. "/old"))
+  h.eq("outside new\n", h.read(outside .. "/new"))
+end)
+
 h.test("refresh exposes proposals without changing live bytes", function()
   local fixture = h.review_fixture("old\n", "new\n")
   local file = fixture.review:files()[1]
@@ -51,17 +119,35 @@ h.test("refresh exposes proposals without changing live bytes", function()
   h.eq(1, #file.hunks)
 end)
 
-h.test("accepts one hunk and rejects another by stable id", function()
+h.test("accepts one hunk and retains only the outstanding hunk", function()
   local fixture = h.review_fixture("a\nb\nc\nd\n", "a\nB\nc\nD\n")
-  local first, second = unpack(fixture.review:files()[1].hunks)
+  local first = fixture.review:files()[1].hunks[1]
 
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", first.id))
-  h.eq(second.id, fixture.review:files()[1].hunks[2].id)
-  h.eq("accepted", fixture.review:files()[1].hunks[1].status)
-  h.eq(nil, action(fixture, "reject_hunk", "main.txt", second.id))
+  local remaining = fixture.review:files()[1].hunks
+  h.eq(1, #remaining)
+  h.eq("pending", remaining[1].status)
+  h.eq(nil, action(fixture, "reject_hunk", "main.txt", remaining[1].id))
 
   h.eq("a\nB\nc\nd\n", fixture.live_bytes())
   h.eq("a\nB\nc\nd\n", fixture.workspace_bytes())
+  h.eq({}, fixture.review:files())
+end)
+
+h.test("accepting a hunk transactionally advances baseline and leaves only outstanding hunks", function()
+  local fixture = h.review_fixture("a\nb\nc\nd\n", "a\nB\nc\nD\n")
+  local first = fixture.review:files()[1].hunks[1]
+
+  h.eq(nil, action(fixture, "accept_hunk", "main.txt", first.id))
+
+  h.eq("a\nB\nc\nd\n", fixture.baseline_bytes())
+  h.eq("a\nB\nc\nD\n", fixture.workspace_bytes())
+  local record = fixture.review:files()[1]
+  h.eq("a\nB\nc\nd\n", record.base)
+  h.eq(1, #record.hunks)
+  h.eq({ "d" }, record.hunks[1].base_lines)
+  h.eq({ "D" }, record.hunks[1].candidate_lines)
+  h.eq("pending", record.hunks[1].status)
 end)
 
 h.test("marks an overlapping live edit as conflict without writing", function()
@@ -85,8 +171,9 @@ h.test("accept preserves and reconciles a non-overlapping live edit", function()
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", 1))
 
   h.eq("1\nTWO\n3\n4\n5\n6\n7\n8\n9\nTEN\n", fixture.live_bytes())
-  h.eq("1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n", fixture.baseline_bytes())
+  h.eq("1\nTWO\n3\n4\n5\n6\n7\n8\n9\nTEN\n", fixture.baseline_bytes())
   h.eq("1\nTWO\n3\n4\n5\n6\n7\n8\n9\nTEN\n", fixture.workspace_bytes())
+  h.eq({}, fixture.review:files())
 end)
 
 h.test("sync_live incorporates safe edits and reports overlapping paths", function()
@@ -110,14 +197,15 @@ h.test("refresh preserves decisions and ids only for identical hunks", function(
   local fixture = h.review_fixture("a\nb\nc\nd\n", "a\nB\nc\nD\n")
   local first_id = fixture.review:files()[1].hunks[1].id
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", first_id))
+  local outstanding_id = fixture.review:files()[1].hunks[1].id
 
   h.eq(nil, action(fixture, "refresh"))
-  h.eq(first_id, fixture.review:files()[1].hunks[1].id)
-  h.eq("accepted", fixture.review:files()[1].hunks[1].status)
+  h.eq(outstanding_id, fixture.review:files()[1].hunks[1].id)
+  h.eq("pending", fixture.review:files()[1].hunks[1].status)
 
   fixture.set_workspace("a\nBee\nc\nD\n")
   h.eq(nil, action(fixture, "refresh"))
-  h.truthy(first_id ~= fixture.review:files()[1].hunks[1].id)
+  h.truthy(outstanding_id ~= fixture.review:files()[1].hunks[1].id)
   h.eq("pending", fixture.review:files()[1].hunks[1].status)
 end)
 
@@ -156,7 +244,8 @@ h.test("accepts a created text file hunk including an empty baseline", function(
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", 1))
 
   h.eq("created\n", fixture.live_bytes())
-  h.eq(nil, fixture.baseline_bytes())
+  h.eq("created\n", fixture.baseline_bytes())
+  h.eq({}, fixture.review:files())
 end)
 
 h.test("requires a whole-file action before accepting a text deletion", function()
@@ -247,7 +336,8 @@ h.test("accounts for an earlier accepted insertion when applying a later hunk", 
   h.eq(2, #hunks)
 
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", hunks[1].id))
-  h.eq(nil, action(fixture, "accept_hunk", "main.txt", hunks[2].id))
+  local remaining = fixture.review:files()[1].hunks[1]
+  h.eq(nil, action(fixture, "accept_hunk", "main.txt", remaining.id))
 
   h.eq("inserted\na\nb\nc\nD\n", fixture.live_bytes())
 end)
@@ -297,17 +387,14 @@ h.test("reconciles a live final-newline edit around an accepted insertion", func
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", 1))
 
   h.eq("inserted\na\nb", fixture.live_bytes())
-  h.eq("a\nb", fixture.baseline_bytes())
+  h.eq("inserted\na\nb", fixture.baseline_bytes())
   h.eq("inserted\na\nb", fixture.workspace_bytes())
-  h.eq("accepted", fixture.review:files()[1].hunks[1].status)
+  h.eq({}, fixture.review:files())
 end)
 
-h.test("sync_live advances an accepted proposal out of review", function()
+h.test("accept_hunk immediately advances an accepted proposal out of review", function()
   local fixture = h.review_fixture("old\n", "new\n")
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", 1))
-  h.eq("accepted", fixture.review:files()[1].status)
-
-  h.eq(nil, action(fixture, "sync_live"))
 
   h.eq("new\n", fixture.baseline_bytes())
   h.eq("new\n", fixture.workspace_bytes())
@@ -408,10 +495,11 @@ h.test("later accept reconciles a deletion adjacent to an accepted insertion onc
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", hunks[1].id))
   fixture.set_live("inserted\nb\nc\nd\n")
 
-  h.eq(nil, action(fixture, "accept_hunk", "main.txt", hunks[2].id))
+  local remaining = fixture.review:files()[1].hunks[1]
+  h.eq(nil, action(fixture, "accept_hunk", "main.txt", remaining.id))
 
   h.eq("inserted\nb\nc\nD\n", fixture.live_bytes())
-  h.eq("b\nc\nd\n", fixture.baseline_bytes())
+  h.eq("inserted\nb\nc\nD\n", fixture.baseline_bytes())
   h.eq("inserted\nb\nc\nD\n", fixture.workspace_bytes())
 end)
 
@@ -583,18 +671,16 @@ h.test("refresh propagates a snapshot read failure", function()
   h.eq({}, review:files())
 end)
 
-h.test("binary live bytes conflict with an outstanding accepted text record", function()
+h.test("sync_live incorporates binary bytes after the text proposal is accepted", function()
   local fixture = h.review_fixture("old\n", "new\n")
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", 1))
   fixture.set_live("binary\0bytes")
 
   local err = action(fixture, "sync_live")
 
-  h.truthy(err)
-  h.eq("conflict", err.code)
-  h.eq({ "main.txt" }, err.paths)
-  h.eq("old\n", fixture.baseline_bytes())
-  h.eq("new\n", fixture.workspace_bytes())
+  h.eq(nil, err)
+  h.eq("binary\0bytes", fixture.baseline_bytes())
+  h.eq("binary\0bytes", fixture.workspace_bytes())
 end)
 
 h.test("a reverted overlap can be revalidated and accepted", function()
@@ -606,7 +692,8 @@ h.test("a reverted overlap can be revalidated and accepted", function()
   h.eq(nil, action(fixture, "accept_hunk", "main.txt", 1))
 
   h.eq("new\n", fixture.live_bytes())
-  h.eq("accepted", fixture.review:files()[1].status)
+  h.eq("new\n", fixture.baseline_bytes())
+  h.eq({}, fixture.review:files())
 end)
 
 h.test("sync clears a derived conflict after the live overlap is reverted", function()

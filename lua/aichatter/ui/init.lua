@@ -39,14 +39,19 @@ end
 
 function UI:_review_action(method, file)
   if not self:_active() then return end
-  local review = self.session.review
-  if not review or type(review[method]) ~= "function" then return end
   local generation = self.generation
-  review[method](review, file.path, function(err)
+  local callback = function(err)
     if not self:_active(generation) then return end
     self:_report_error(err, generation)
     self:_reconcile_review(generation)
-  end)
+  end
+  if type(self.session.review_action) == "function" then
+    self.session:review_action(method, file.path, callback)
+    return
+  end
+  local review = self.session.review
+  if not review or type(review[method]) ~= "function" then return end
+  review[method](review, file.path, callback)
 end
 
 function UI:_reconcile_review(generation)
@@ -57,7 +62,21 @@ end
 
 function UI:_open_review(file)
   if not self:_active() or not self.layout then return end
-  if self.diff_view then self.diff_view:close() end
+  if self.diff_view then
+    if self.diff_view.path == file.path then
+      self.diff_view:reconcile()
+      return
+    end
+    local candidate = self.diff_view.candidate_bufnr
+    if candidate and vim.api.nvim_buf_is_valid(candidate) and vim.bo[candidate].modified then
+      (self.opts.notify or vim.notify)(
+        "Save or discard the modified candidate before opening another file",
+        vim.log.levels.WARN,
+        { title = "aichatter.nvim" })
+      return
+    end
+    self.diff_view:close()
+  end
   local winid = self.layout.main_win
   if not winid or not vim.api.nvim_win_is_valid(winid) then return end
   vim.api.nvim_set_current_win(winid)
@@ -65,6 +84,9 @@ function UI:_open_review(file)
     winid = winid,
     mappings = self.opts.mappings,
     notify = self.opts.notify or vim.notify,
+    on_action = type(self.session.review_action) == "function" and function(method, ...)
+      return self.session:review_action(method, ...)
+    end or nil,
     on_change = function()
       if self:_active() then self:render_changes() end
     end,
@@ -86,6 +108,7 @@ function UI:_render_state()
 end
 
 function UI:_command_approval(value)
+  if not self.layout or self.layout.closed then return end
   local generation = self.generation
   local request_id = value and value.requestId
   if not request_id then return end
@@ -244,6 +267,7 @@ function UI:open()
   self.transcript.winid = self.layout.transcript_win
   self.changes.winid = self.layout.changes_win
   self.composer.winid = self.layout.composer_win
+  self.hidden = false
   self:render()
   self:_render_state()
   self:_reconcile_command_approvals()
@@ -252,10 +276,20 @@ end
 
 function UI:toggle()
   if self.layout and not self.layout.closed then
-    self:close()
+    self:hide()
   else
     self:open()
   end
+end
+
+function UI:hide()
+  if not self.layout then return end
+  self.layout:close()
+  self.layout = nil
+  self.transcript.winid = nil
+  self.changes.winid = nil
+  self.composer.winid = nil
+  self.hidden = true
 end
 
 function UI:close()
@@ -270,6 +304,7 @@ function UI:close()
   self.changes:close()
   self.composer:close()
   self.layout = nil
+  self.hidden = false
 end
 
 local M = {}
@@ -283,6 +318,7 @@ function M.new(session, opts)
     opts = opts,
     layout = nil,
     closed = false,
+    hidden = false,
     generation = 0,
   }, UI)
   self:_make_views()

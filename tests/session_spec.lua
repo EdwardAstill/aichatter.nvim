@@ -210,11 +210,18 @@ end)
 h.test("auto-accepts shadow file requests but waits on command requests", function()
   local fixture = h.session_fixture()
 
-  fixture.transport:server_request(41, "item/fileChange/requestApproval", { itemId = "f1" })
+  fixture.session:send("Edit safely")
+  fixture.transport:server_request(41, "item/fileChange/requestApproval", {
+    threadId = "thread-1",
+    turnId = "turn-1",
+    itemId = "f1",
+    grantRoot = "/shadow/workspace",
+  })
   h.eq("acceptForSession", fixture.transport.responses[41].result.decision)
 
-  fixture.session:send("Run checks")
   fixture.transport:server_request(42, "item/commandExecution/requestApproval", {
+    threadId = "thread-1",
+    turnId = "turn-1",
     command = { "make", "test" },
   })
   h.eq("waiting_for_command_approval", fixture.session.state)
@@ -225,29 +232,66 @@ h.test("auto-accepts shadow file requests but waits on command requests", functi
   h.eq("running", fixture.session.state)
 end)
 
-h.test("does not auto-accept file approvals without a disposable shadow thread", function()
+h.test("explicitly declines file approvals without a disposable active turn", function()
   local transport = h.fake_transport({})
   Session.new({ transport = transport, emit = function() end })
 
   transport:server_request(7, "item/fileChange/requestApproval", { itemId = "f1" })
 
-  h.eq(nil, transport.responses[7])
+  h.eq("decline", transport.responses[7].result.decision)
 end)
 
-h.test("does not auto-accept a file approval granting an external root", function()
+h.test("explicitly declines stale and external file approvals", function()
   local fixture = h.session_fixture()
+  fixture.session:send("Edit safely")
 
   fixture.transport:server_request(8, "item/fileChange/requestApproval", {
+    threadId = "thread-1",
+    turnId = "turn-stale",
     itemId = "f1",
     grantRoot = "/project",
   })
   fixture.transport:server_request(9, "item/fileChange/requestApproval", {
+    threadId = "thread-1",
+    turnId = "turn-1",
     itemId = "f2",
-    grantRoot = "/shadow/workspace/generated",
+    grantRoot = "/project",
   })
 
-  h.eq(nil, fixture.transport.responses[8])
-  h.eq("acceptForSession", fixture.transport.responses[9].result.decision)
+  h.eq("decline", fixture.transport.responses[8].result.decision)
+  h.eq("decline", fixture.transport.responses[9].result.decision)
+end)
+
+h.test("declines a grant that traverses a symlink inside the shadow", function()
+  local workspace = h.tempdir()
+  local outside = h.tempdir()
+  h.mkdir(workspace .. "/safe")
+  h.symlink(outside, workspace .. "/escape")
+  local fixture = h.session_fixture({
+    shadow = {
+      project_root = h.tempdir(),
+      baseline_root = workspace .. "/../baseline",
+      workspace_root = workspace,
+      cleanup = function(_, callback) callback() end,
+    },
+  })
+  fixture.session:send("Edit safely")
+
+  fixture.transport:server_request(10, "item/fileChange/requestApproval", {
+    threadId = "thread-1",
+    turnId = "turn-1",
+    itemId = "safe",
+    grantRoot = workspace .. "/safe",
+  })
+  fixture.transport:server_request(11, "item/fileChange/requestApproval", {
+    threadId = "thread-1",
+    turnId = "turn-1",
+    itemId = "escape",
+    grantRoot = workspace .. "/escape/child",
+  })
+
+  h.eq("acceptForSession", fixture.transport.responses[10].result.decision)
+  h.eq("decline", fixture.transport.responses[11].result.decision)
 end)
 
 h.test("cancel interrupts the active turn and retains the shadow", function()
@@ -269,14 +313,15 @@ h.test("cancel interrupts the active turn and retains the shadow", function()
 end)
 
 h.test("aborts conflicted live synchronization and emits affected paths", function()
+  local files = { { path = "main.lua", status = "conflict" } }
   local review = {
     refresh = function(_, callback) callback() end,
-    files = function() return {} end,
+    files = function() return files end,
     sync_live = function(_, callback)
       callback({ code = "conflict", paths = { "a.lua", "b.lua" } })
     end,
   }
-  local fixture = h.session_fixture({ review = review, files = {} })
+  local fixture = h.session_fixture({ review = review })
   local calls, send_error = 0
 
   fixture.session:send("Continue", function(err)
@@ -286,7 +331,7 @@ h.test("aborts conflicted live synchronization and emits affected paths", functi
 
   h.eq(1, calls)
   h.eq("conflict", send_error.code)
-  h.eq("idle", fixture.session.state)
+  h.eq("reviewable", fixture.session.state)
   h.eq(0, #requests(fixture.transport, "turn/start"))
   h.eq("conflict", fixture.events[1].name)
   h.eq({ "a.lua", "b.lua" }, fixture.events[1].value.paths)
@@ -438,7 +483,7 @@ h.test("rejects unsupported ephemeral threads with the upgrade diagnostic", func
 end)
 
 h.test("restarts once with the same shadow review and transcript", function()
-  local fixture = h.session_fixture()
+  local fixture = h.session_fixture({ files = {} })
   fixture.session:send("Before crash")
   local shadow = fixture.session.shadow
   local review = fixture.session.review
@@ -458,6 +503,113 @@ h.test("restarts once with the same shadow review and transcript", function()
   fixture.transport:emit("exit", { code = 24 })
   h.eq(1, fixture.transport.starts)
   h.eq("failed", fixture.session.state)
+end)
+
+h.test("refreshes crash partial edits before recovery becomes reviewable", function()
+  local files = {}
+  local review = {
+    refresh_count = 0,
+    sync_count = 0,
+    refresh = function(self, callback)
+      self.refresh_count = self.refresh_count + 1
+      files = { { path = "partial.lua", status = "pending" } }
+      callback()
+    end,
+    sync_live = function(self, callback)
+      self.sync_count = self.sync_count + 1
+      callback()
+    end,
+    files = function() return files end,
+  }
+  local fixture = h.session_fixture({ review = review, files = files })
+  fixture.session:send("write then crash")
+
+  fixture.transport:emit("exit", { code = 23 })
+
+  h.eq(1, review.refresh_count)
+  h.eq("reviewable", fixture.session.state)
+  h.eq(fixture.shadow.workspace_root,
+    requests(fixture.transport, "thread/start")[1].params.cwd)
+  local followup_error
+  fixture.session:send("continue from partial", function(err) followup_error = err end)
+  h.eq(nil, followup_error)
+  h.eq("running", fixture.session.state)
+end)
+
+h.test("serializes review actions and reconciles an empty queue to idle", function()
+  local callbacks = {}
+  local calls = {}
+  local files = { { path = "main.lua", status = "pending" } }
+  local review = {
+    refresh = function(_, callback) callback() end,
+    sync_live = function(_, callback) callback() end,
+    files = function() return files end,
+    accept_file = function(_, path, callback)
+      calls[#calls + 1] = "accept:" .. path
+      callbacks[#callbacks + 1] = function()
+        files = {}
+        callback()
+      end
+    end,
+    reject_file = function(_, path, callback)
+      calls[#calls + 1] = "reject:" .. path
+      callbacks[#callbacks + 1] = callback
+    end,
+  }
+  local fixture = h.session_fixture({ review = review, state = "reviewable" })
+  local completed = 0
+
+  h.truthy(fixture.session:review_action("accept_file", "main.lua", function(err)
+    h.eq(nil, err)
+    completed = completed + 1
+  end))
+  h.truthy(fixture.session:review_action("reject_file", "main.lua", function(err)
+    h.eq(nil, err)
+    completed = completed + 1
+  end))
+  h.eq({ "accept:main.lua" }, calls)
+  callbacks[1]()
+  h.eq({ "accept:main.lua", "reject:main.lua" }, calls)
+  callbacks[2]()
+
+  h.eq(2, completed)
+  h.eq("idle", fixture.session.state)
+end)
+
+h.test("gates review actions while a turn or send synchronization is active", function()
+  local fixture = h.session_fixture()
+  fixture.session:send("running")
+  local err
+
+  local accepted = fixture.session:review_action("accept_file", "main.lua", function(value)
+    err = value
+  end)
+
+  h.falsy(accepted)
+  h.eq("invalid_state", err.code)
+end)
+
+h.test("close joins an active review mutation before shadow cleanup", function()
+  local mutation_callback
+  local review = {
+    refresh = function(_, callback) callback() end,
+    sync_live = function(_, callback) callback() end,
+    files = function() return { { path = "main.lua", status = "pending" } } end,
+    accept_file = function(_, _, callback) mutation_callback = callback end,
+  }
+  local fixture = h.session_fixture({ review = review, state = "reviewable" })
+  local review_error, closed = nil, false
+  fixture.session:review_action("accept_file", "main.lua", function(err) review_error = err end)
+
+  fixture.session:close(function() closed = true end)
+
+  h.eq(0, fixture.shadow.cleanup_count)
+  h.falsy(closed)
+  mutation_callback()
+  h.eq(nil, review_error)
+  h.eq(1, fixture.shadow.cleanup_count)
+  h.truthy(closed)
+  h.eq("closed", fixture.session.state)
 end)
 
 h.test("invokes callbacks once and ignores duplicate turn completion", function()
@@ -620,14 +772,14 @@ h.test("exit rejects callback re-entry before beginning recovery", function()
   h.eq(0, #requests(fixture.transport, "turn/start"))
 end)
 
-h.test("ignores a delayed review refresh after exit recovery", function()
-  local refresh_callback
+h.test("ignores a stale completion refresh and waits for the crash refresh", function()
+  local refresh_callbacks = {}
   local review = {
     refresh_count = 0,
     sync_live = function(_, callback) callback() end,
     refresh = function(self, callback)
       self.refresh_count = self.refresh_count + 1
-      refresh_callback = callback
+      refresh_callbacks[#refresh_callbacks + 1] = callback
     end,
     files = function() return { { path = "main.lua", status = "pending" } } end,
   }
@@ -638,10 +790,16 @@ h.test("ignores a delayed review refresh after exit recovery", function()
   })
   fixture.transport:emit("exit", { code = 23 })
 
-  local ok = pcall(refresh_callback)
+  h.eq(2, #refresh_callbacks)
+  h.eq("starting", fixture.session.state)
+  h.eq(0, fixture.transport.starts)
+  local stale_ok = pcall(refresh_callbacks[1])
+  h.eq("starting", fixture.session.state)
+  local recovery_ok = pcall(refresh_callbacks[2])
 
-  h.truthy(ok)
-  h.eq("idle", fixture.session.state)
+  h.truthy(stale_ok)
+  h.truthy(recovery_ok)
+  h.eq("reviewable", fixture.session.state)
   h.eq(1, fixture.transport.starts)
 end)
 
@@ -797,7 +955,10 @@ end)
 
 h.test("restarts idle and reviewable sessions and fails their second exit", function()
   for _, value in ipairs({ "idle", "reviewable" }) do
-    local fixture = h.session_fixture({ state = value })
+    local fixture = h.session_fixture({
+      state = value,
+      files = value == "reviewable" and { { path = "main.lua" } } or {},
+    })
 
     fixture.transport:emit("exit", { code = 23 })
     h.eq(value, fixture.session.state)

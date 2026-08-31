@@ -47,6 +47,32 @@ h.test("keyboard and mouse dispatch through the same row actions", function()
   view:close()
 end)
 
+h.test("maps queue defaults through documented plug mappings", function()
+  local view = require("aichatter.ui.changes").new({})
+  vim.api.nvim_set_current_buf(view.bufnr)
+
+  h.eq("<Plug>(AIChatterChangesOpen)", vim.fn.maparg("o", "n", false, true).rhs)
+  h.eq("<Plug>(AIChatterChangesAccept)", vim.fn.maparg("a", "n", false, true).rhs)
+  h.eq("<Plug>(AIChatterChangesReject)", vim.fn.maparg("r", "n", false, true).rhs)
+  h.truthy(vim.fn.maparg("<Plug>(AIChatterChangesOpen)", "n", false, true).callback ~= nil)
+  h.truthy(vim.fn.maparg("<Plug>(AIChatterChangesAccept)", "n", false, true).callback ~= nil)
+  h.truthy(vim.fn.maparg("<Plug>(AIChatterChangesReject)", "n", false, true).callback ~= nil)
+  view:close()
+end)
+
+h.test("queue action callback errors are returned without throwing", function()
+  local view = require("aichatter.ui.changes").new({
+    on_accept = function() error("queued callback exploded") end,
+  })
+  view:render({ one_file() })
+
+  local ok, err = view:activate_at(1, view.actions[1].accept.start)
+
+  h.falsy(ok)
+  h.matches("queued callback exploded", err.message)
+  view:close()
+end)
+
 h.test("mouse clicks invoke only exact known action spans", function()
   local calls = 0
   local view = require("aichatter.ui.changes").new({

@@ -26,6 +26,41 @@ local function permissions(mode)
   return bit.band(mode, 511)
 end
 
+local function no_follow_read_flags()
+  local constants = uv.constants or {}
+  local readonly = type(constants.O_RDONLY) == "number" and constants.O_RDONLY or 0
+  local nofollow = constants.O_NOFOLLOW
+  if type(nofollow) ~= "number" then
+    local uname = uv.os_uname and uv.os_uname() or {}
+    if uname.sysname == "Linux" then
+      nofollow = 131072
+    elseif uname.sysname == "Darwin" then
+      nofollow = 256
+    end
+  end
+  if type(nofollow) ~= "number" then
+    failure("safe no-follow file opens are unavailable on this platform", "unsupported")
+  end
+  return bit.bor(readonly, nofollow)
+end
+
+local function same_identity(left, right)
+  return left and right and left.dev ~= nil and left.ino ~= nil
+    and left.dev == right.dev and left.ino == right.ino
+end
+
+local function same_timestamp(left, right)
+  return left and right and left.sec == right.sec and left.nsec == right.nsec
+end
+
+local function same_file_version(left, right)
+  return same_identity(left, right) and right.type == "file"
+    and left.size == right.size
+    and permissions(left.mode) == permissions(right.mode)
+    and same_timestamp(left.mtime, right.mtime)
+    and same_timestamp(left.ctime, right.ctime)
+end
+
 local function close_fd(fd)
   if fd then
     uv.fs_close(fd)
@@ -95,16 +130,25 @@ local function open_unique_sibling(target, mode)
   failure("could not create a unique temporary sibling for " .. target)
 end
 
-local function copy_file_bytes(source, target, mode)
-  local source_fd, open_err, open_code = uv.fs_open(source, "r", 0)
+local function copy_file_bytes(source, target, source_stat)
+  local source_fd, open_err, open_code = uv.fs_open(source, no_follow_read_flags(), 0)
   check(source_fd, open_err, open_code, "open", source)
+
+  local source_opened, opened_err, opened_code = uv.fs_fstat(source_fd)
+  if not source_opened or not same_file_version(source_stat, source_opened) then
+    close_fd(source_fd)
+    if not source_opened then
+      check(source_opened, opened_err, opened_code, "fstat", source)
+    end
+    failure("source file identity changed while opening " .. source, "changed")
+  end
 
   local temp
   local target_fd
-  local opened, open_failure = xpcall(function()
-    temp, target_fd = open_unique_sibling(target, mode)
+  local prepared, open_failure = xpcall(function()
+    temp, target_fd = open_unique_sibling(target, source_stat.mode)
   end, identity)
-  if not opened then
+  if not prepared then
     close_fd(source_fd)
     error(open_failure, 0)
   end
@@ -133,12 +177,20 @@ local function copy_file_bytes(source, target, mode)
       end
       offset = offset + #bytes
     end
+    local final_fd, final_fd_err, final_fd_code = uv.fs_fstat(source_fd)
+    check(final_fd, final_fd_err, final_fd_code, "fstat", source)
+    local final_path, final_path_err, final_path_code = uv.fs_lstat(source)
+    check(final_path, final_path_err, final_path_code, "lstat", source)
+    if not same_file_version(source_opened, final_fd)
+      or not same_file_version(source_opened, final_path) then
+      failure("source file changed while copying " .. source, "changed")
+    end
     local synced, sync_err, sync_code = uv.fs_fsync(target_fd)
     check(synced, sync_err, sync_code, "fsync", temp)
     local closed, close_err, close_code = uv.fs_close(target_fd)
     check(closed, close_err, close_code, "close", temp)
     target_fd = nil
-    local changed, chmod_err, chmod_code = uv.fs_chmod(temp, permissions(mode))
+    local changed, chmod_err, chmod_code = uv.fs_chmod(temp, permissions(source_stat.mode))
     check(changed, chmod_err, chmod_code, "chmod", temp)
     local renamed, rename_err, rename_code = uv.fs_rename(temp, target)
     check(renamed, rename_err, rename_code, "rename", target)
@@ -262,7 +314,18 @@ local function enqueue_children(job, source, target, relative)
   end
 end
 
+local function validate_source_anchors(entry)
+  for _, anchor in ipairs(entry.anchors or {}) do
+    local current, err, code = uv.fs_lstat(anchor.path)
+    check(current, err, code, "lstat", anchor.path)
+    if current.type ~= "directory" or not same_identity(current, anchor.stat) then
+      failure("source directory identity changed during traversal: " .. anchor.path, "changed")
+    end
+  end
+end
+
 local function copy_entry(job, entry)
+  validate_source_anchors(entry)
   local stat, stat_err, stat_code = uv.fs_lstat(entry.source)
   check(stat, stat_err, stat_code, "lstat", entry.source)
 
@@ -272,16 +335,31 @@ local function copy_entry(job, entry)
       local made, mkdir_err, mkdir_code = uv.fs_mkdir(entry.target, permissions(stat.mode))
       check(made, mkdir_err, mkdir_code, "mkdir", entry.target)
     end
+    local queue_start = #job.queue + 1
     enqueue_children(job, entry.source, entry.target, entry.relative)
+    local after, after_err, after_code = uv.fs_lstat(entry.source)
+    check(after, after_err, after_code, "lstat", entry.source)
+    if after.type ~= "directory" or not same_identity(stat, after) then
+      while #job.queue >= queue_start do table.remove(job.queue) end
+      failure("source directory identity changed during traversal: " .. entry.source, "changed")
+    end
+    local anchors = vim.deepcopy(entry.anchors or {})
+    anchors[#anchors + 1] = { path = entry.source, stat = stat }
+    for index = queue_start, #job.queue do job.queue[index].anchors = anchors end
   elseif stat.type == "link" then
     prepare_destination(job, entry.target, "link")
     local link, read_err, read_code = uv.fs_readlink(entry.source)
     check(link, read_err, read_code, "readlink", entry.source)
+    local after, after_err, after_code = uv.fs_lstat(entry.source)
+    check(after, after_err, after_code, "lstat", entry.source)
+    if after.type ~= "link" or not same_identity(stat, after) then
+      failure("source link identity changed while copying " .. entry.source, "changed")
+    end
     local made, link_err, link_code = uv.fs_symlink(link, entry.target)
     check(made, link_err, link_code, "symlink", entry.target)
   elseif stat.type == "file" then
     prepare_destination(job, entry.target, "file")
-    copy_file_bytes(entry.source, entry.target, stat.mode)
+    copy_file_bytes(entry.source, entry.target, stat)
   else
     failure("unsupported file type at " .. entry.source)
   end
@@ -301,6 +379,7 @@ function M.copy_tree(source, target, opts, callback)
       source = path.normalize(source),
       target = path.normalize(target),
       relative = "",
+      anchors = {},
     } },
     next_entry = 1,
     copied = 0,
@@ -434,6 +513,49 @@ function M.atomic_write(target, bytes, mode, opts, callback)
   end)
 end
 
+function M.atomic_symlink(target, link_text, opts, callback)
+  if type(opts) == "function" or opts == nil then
+    callback, opts = opts, {}
+  end
+  callback = callback or function() end
+  opts = opts or {}
+  target = path.normalize(target)
+  local called = false
+  local function finish(err)
+    if called then return end
+    called = true
+    pcall(callback, err)
+  end
+  schedule(function()
+    local temp
+    local ok, err = xpcall(function()
+      ensure_directory(vim.fs.dirname(target))
+      for _ = 1, 10 do
+        atomic_counter = atomic_counter + 1
+        temp = string.format("%s.aichatter-link-%d-%d", target, uv.os_getpid(), atomic_counter)
+        local made, make_err, make_code = uv.fs_symlink(link_text, temp)
+        if made then break end
+        temp = nil
+        if make_code ~= "EEXIST" then check(made, make_err, make_code, "symlink", target) end
+      end
+      if not temp then failure("could not create a unique temporary symlink for " .. target) end
+      if opts.before_commit then
+        local guard_err = opts.before_commit()
+        if guard_err then error(guard_err, 0) end
+      end
+      local renamed, rename_err, rename_code = uv.fs_rename(temp, target)
+      check(renamed, rename_err, rename_code, "rename", target)
+      temp = nil
+    end, identity)
+    if temp then uv.fs_unlink(temp) end
+    if ok then
+      finish()
+    else
+      finish(type(err) == "table" and err or { message = tostring(err) })
+    end
+  end)
+end
+
 remove_entry = function(target)
   local stat, stat_err, stat_code = uv.fs_lstat(target)
   if not stat then
@@ -461,8 +583,12 @@ remove_entry = function(target)
   end
 end
 
-function M.remove_tree_guarded(target, expected_parent, callback)
+function M.remove_tree_guarded(target, expected_parent, opts, callback)
+  if type(opts) == "function" or opts == nil then
+    callback, opts = opts, {}
+  end
   callback = callback or function() end
+  opts = opts or {}
   target = path.normalize(target)
   expected_parent = path.normalize(expected_parent)
 
@@ -480,6 +606,33 @@ function M.remove_tree_guarded(target, expected_parent, callback)
     return
   end
 
+  local function validate_recorded_identity()
+    if opts.parent_identity then
+      local parent, parent_err, parent_code = uv.fs_lstat(expected_parent)
+      if not parent then
+        return { code = parent_code, message = parent_err or "recorded temp parent disappeared" }
+      end
+      if parent.type ~= "directory" or not same_identity(parent, opts.parent_identity) then
+        return { code = "identity_changed", message = "recorded temp parent identity changed" }
+      end
+    end
+    if opts.identity then
+      local current, current_err, current_code = uv.fs_lstat(target)
+      if not current then
+        return { code = current_code, message = current_err or "recorded session disappeared" }
+      end
+      if current.type ~= "directory" or not same_identity(current, opts.identity) then
+        return { code = "identity_changed", message = "recorded session identity changed" }
+      end
+    end
+  end
+
+  local identity_err = validate_recorded_identity()
+  if identity_err then
+    pcall(callback, identity_err)
+    return
+  end
+
   local ancestors_ok, ancestor_err = xpcall(function()
     reject_symlink_ancestors(vim.fs.dirname(target))
   end, identity)
@@ -492,6 +645,8 @@ function M.remove_tree_guarded(target, expected_parent, callback)
   schedule(function()
     local ok, err = xpcall(function()
       reject_symlink_ancestors(vim.fs.dirname(target))
+      local changed = validate_recorded_identity()
+      if changed then error(changed, 0) end
       remove_entry(target)
     end, identity)
     local callback_error

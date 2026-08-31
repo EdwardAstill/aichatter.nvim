@@ -83,6 +83,17 @@ h.test("uses configurable buffer-local mappings without global mappings", functi
   composer:close()
 end)
 
+h.test("maps composer defaults through documented plug mappings", function()
+  local composer = require("aichatter.ui.composer").new({})
+  vim.api.nvim_set_current_buf(composer.bufnr)
+
+  h.eq("<Plug>(AIChatterComposerSubmit)", vim.fn.maparg("<CR>", "i", false, true).rhs)
+  h.eq("<Plug>(AIChatterComposerNewline)", vim.fn.maparg("<C-j>", "i", false, true).rhs)
+  h.truthy(vim.fn.maparg("<Plug>(AIChatterComposerSubmit)", "i", false, true).callback ~= nil)
+  h.truthy(vim.fn.maparg("<Plug>(AIChatterComposerNewline)", "i", false, true).callback ~= nil)
+  composer:close()
+end)
+
 h.test("composed UI retains text rejected synchronously by the session", function()
   local session = {
     state = "idle",

@@ -120,10 +120,14 @@ function M.new(opts)
     pending = nil,
     closed = false,
   }, Composer)
-  vim.keymap.set("i", mappings.submit, function() self:submit() end,
+  vim.keymap.set("i", "<Plug>(AIChatterComposerSubmit)", function() self:submit() end,
     { buffer = bufnr, silent = true })
-  vim.keymap.set("i", mappings.newline, function() self:newline() end,
+  vim.keymap.set("i", "<Plug>(AIChatterComposerNewline)", function() self:newline() end,
     { buffer = bufnr, silent = true })
+  vim.keymap.set("i", mappings.submit, "<Plug>(AIChatterComposerSubmit)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("i", mappings.newline, "<Plug>(AIChatterComposerNewline)",
+    { buffer = bufnr, silent = true, remap = true })
   return self
 end
 

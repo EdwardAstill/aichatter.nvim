@@ -255,6 +255,26 @@ h.test("cancels one active turn through the public command", function()
   vim.env.TMPDIR = old_tmpdir
 end)
 
+h.test("does not report a startup cancellation as an error when the chat closes", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  local messages = {}
+  local old_notify = vim.notify
+  vim.notify = function(message)
+    messages[#messages + 1] = tostring(message)
+  end
+  configure(root, "authenticated")
+
+  vim.cmd("AIChat")
+  vim.cmd("AIChatClose")
+
+  h.truthy(h.wait_for(function()
+    return #buffers("aichatter-composer") == 0
+  end, 3000))
+  vim.notify = old_notify
+  vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
+  h.falsy(table.concat(messages, "\n"):find("session closing", 1, true))
+end)
+
 h.test("restarts the fake process once and preserves the visible session", function()
   local root = h.git_project({ ["main.lua"] = "return true\n" })
   local temp_parent = h.tempdir()
@@ -329,5 +349,62 @@ h.test("adds only contained regular files and exact visual lines", function()
   vim.cmd("AIChatAddFile")
   h.eq({ "lua/extra.lua", "main.lua" }, offered)
   vim.ui.select = old_select
+  close_chat()
+end)
+
+h.test("refreshes crash-after-write proposals and continues in the restarted process", function()
+  local root = h.git_project({ ["main.lua"] = "base\n" })
+  local temp_parent = h.tempdir()
+  local old_tmpdir = vim.env.TMPDIR
+  vim.env.TMPDIR = temp_parent
+  configure(root, "crash-after-write")
+  vim.cmd("AIChat")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+
+  submit("crash after writing")
+  local changes = assert(buffer("aichatter-changes"))
+  h.truthy(h.wait_for(function()
+    return h.buffer_text(changes):find("main.lua", 1, true) ~= nil
+      and status_is("reviewable")
+  end, 6000))
+  local isolated = assert(session_root(temp_parent), "session directory not found")
+  h.eq("partial\n", h.read(isolated .. "/workspace/main.lua"))
+  h.eq("base\n", h.read(root .. "/main.lua"))
+
+  vim.api.nvim_set_current_win(assert(window_for(changes)))
+  h.invoke_mapping(changes, "n", "o")
+  local diff_buf = assert(buffer("aichatter-diff"), "diff buffer not found")
+  h.matches("%+partial", h.buffer_text(diff_buf))
+
+  submit("revise the partial result")
+  h.truthy(h.wait_for(function()
+    return h.read(isolated .. "/workspace/main.lua") == "followup\n"
+      and h.buffer_text(diff_buf):find("+followup", 1, true) ~= nil
+      and status_is("reviewable")
+  end, 6000))
+  h.eq("base\n", h.read(root .. "/main.lua"))
+
+  local old_select = vim.ui.select
+  vim.ui.select = function(_, _, callback) callback("Discard pending changes") end
+  vim.cmd("AIChatClose")
+  h.truthy(h.wait_for(function()
+    return vim.fn.isdirectory(isolated) == 0 and #buffers("aichatter-composer") == 0
+  end, 5000))
+  vim.ui.select = old_select
+  vim.env.TMPDIR = old_tmpdir
+  vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
+end)
+
+h.test("AIChat retries a failed session instead of only toggling the view", function()
+  local root = h.git_project({ ["main.lua"] = "return true\n" })
+  configure(root, "unsupported-sandbox")
+  vim.cmd("AIChat")
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
+  submit("fail on unsupported sandbox")
+  h.truthy(h.wait_for(function() return status_is("failed") end, 5000))
+
+  vim.cmd("AIChat")
+
+  h.truthy(h.wait_for(function() return status_is("idle") end, 5000))
   close_chat()
 end)

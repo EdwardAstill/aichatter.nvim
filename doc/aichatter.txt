@@ -101,6 +101,15 @@ Unified hunk review:
   r           Reject the current hunk.
   e           Edit the complete candidate in a shadow-only acwrite buffer.
 
+Each default forwards through a buffer-local <Plug> mapping, so a custom
+mapping can invoke the same action. The targets are:
+
+  <Plug>(AIChatterComposerSubmit)        <Plug>(AIChatterComposerNewline)
+  <Plug>(AIChatterChangesOpen)           <Plug>(AIChatterChangesAccept)
+  <Plug>(AIChatterChangesReject)         <Plug>(AIChatterReviewPreviousHunk)
+  <Plug>(AIChatterReviewNextHunk)        <Plug>(AIChatterReviewAccept)
+  <Plug>(AIChatterReviewReject)          <Plug>(AIChatterReviewEdit)
+
 ==============================================================================
 6. SAFETY AND LIMITATIONS                              *aichatter-safety*
 

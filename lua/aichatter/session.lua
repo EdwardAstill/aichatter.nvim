@@ -21,7 +21,7 @@ local allowed = {
     closing = true,
   },
   auth_required = { idle = true, failed = true, closing = true },
-  idle = { running = true, failed = true, closing = true },
+  idle = { running = true, reviewable = true, failed = true, closing = true },
   running = {
     waiting_for_command_approval = true,
     idle = true,
@@ -139,6 +139,33 @@ local function cleanup_shadow(shadow)
   pcall(shadow.cleanup, shadow, noop)
 end
 
+local function no_follow_grant(shadow, value)
+  if type(shadow.validate_grant_root) == "function" then
+    local ok, accepted, detail = pcall(shadow.validate_grant_root, shadow, value)
+    return ok and accepted == true, ok and detail or accepted
+  end
+  local root = shadow.workspace_root
+  if type(root) ~= "string" then return false end
+  local grant = value
+  if grant == nil or grant == vim.NIL then grant = root end
+  if type(grant) ~= "string" then return false end
+  local ok, absolute = pcall(path.normalize, grant, root)
+  if not ok or (absolute ~= root and not path.is_within(root, absolute)) then return false end
+  local uv = vim.uv or vim.loop
+  local current = root
+  local root_stat = uv.fs_lstat(current)
+  if not root_stat or root_stat.type ~= "directory" then return false end
+  local relative = path.relative(root, absolute)
+  if relative ~= "." then
+    for component in relative:gmatch("[^/]+") do
+      current = current .. "/" .. component
+      local stat = uv.fs_lstat(current)
+      if not stat or stat.type ~= "directory" then return false end
+    end
+  end
+  return true, absolute
+end
+
 function Session.new(deps)
   deps = deps or {}
   local transport = deps.transport or Transport.new()
@@ -171,6 +198,10 @@ function Session.new(deps)
     _pending_turn = nil,
     _expected_exit = false,
     _settling = false,
+    _review_queue = {},
+    _review_active = nil,
+    _review_waiters = {},
+    _review_sequence = 0,
   }, Session)
   self:_register_handlers()
   return self
@@ -229,6 +260,113 @@ end
 function Session:_reject_reentry(callback)
   if not self._settling then return false end
   callback(state_error("session lifecycle transition in progress"))
+  return true
+end
+
+local review_methods = {
+  refresh = true,
+  accept_hunk = true,
+  reject_hunk = true,
+  edit_candidate = true,
+  accept_file = true,
+  reject_file = true,
+}
+
+function Session:_notify_review_idle()
+  if self._review_active or #self._review_queue > 0 then return end
+  local waiters = self._review_waiters
+  self._review_waiters = {}
+  for _, waiter in ipairs(waiters) do pcall(waiter) end
+end
+
+function Session:_when_review_idle(callback)
+  if not self._review_active and #self._review_queue == 0 then
+    callback()
+  else
+    self._review_waiters[#self._review_waiters + 1] = callback
+  end
+end
+
+function Session:_cancel_review_queue(err)
+  local queued = self._review_queue
+  self._review_queue = {}
+  for _, action in ipairs(queued) do action.callback(error_value(err)) end
+  self:_notify_review_idle()
+end
+
+function Session:_reconcile_review_state()
+  if self.disposed or (self.state ~= "idle" and self.state ~= "reviewable") then return nil end
+  local ok, files = pcall(self.review.files, self.review)
+  if not ok then return error_value(files) end
+  files = files or {}
+  if #files == 0 and self.state == "reviewable" then
+    self:_transition("idle")
+  elseif #files > 0 and self.state == "idle" then
+    self:_transition("reviewable")
+  end
+  self:_emit("review", files)
+  return nil
+end
+
+function Session:_start_review_action()
+  if self._review_active or self.disposed then
+    self:_notify_review_idle()
+    return
+  end
+  local action = table.remove(self._review_queue, 1)
+  if not action then
+    self:_notify_review_idle()
+    return
+  end
+  self._review_active = action
+  local completed = once(function(err, ...)
+    if self._review_active ~= action then return end
+    self._review_active = nil
+    if not err and #self._review_queue == 0 then err = self:_reconcile_review_state() end
+    action.callback(err, ...)
+    if self.disposed then
+      self:_cancel_review_queue({ code = "closing", message = "session closing" })
+    else
+      self:_start_review_action()
+    end
+    self:_notify_review_idle()
+  end)
+  local method = self.review and self.review[action.method]
+  if type(method) ~= "function" then
+    completed({ code = "unsupported", message = "review action is unavailable: " .. action.method })
+    return
+  end
+  local args = vim.list_slice(action.args)
+  args[#args + 1] = completed
+  local ok, thrown = pcall(method, self.review, unpack(args))
+  if not ok then completed(error_value(thrown)) end
+end
+
+function Session:review_action(method, ...)
+  local args = { ... }
+  local callback = type(args[#args]) == "function" and table.remove(args) or nil
+  callback = public_callback(callback)
+  local function reject(err)
+    callback(err)
+    return false, err
+  end
+  if self:_reject_reentry(callback) then return false end
+  if self.disposed then return reject(state_error("session is disposed")) end
+  if not review_methods[method] then
+    return reject({ code = "unsupported", message = "unknown review action: " .. tostring(method) })
+  end
+  if (self.state ~= "idle" and self.state ~= "reviewable") or self._sending then
+    return reject(state_error("review actions require an idle or reviewable session"))
+  end
+  if not self.review then return reject(state_error("session review is not initialized")) end
+  self._review_sequence = self._review_sequence + 1
+  self._review_queue[#self._review_queue + 1] = {
+    id = self._review_sequence,
+    method = method,
+    args = args,
+    callback = callback,
+  }
+  self:_start_review_action()
   return true
 end
 
@@ -377,22 +515,21 @@ function Session:_on_protocol_error(params)
 end
 
 function Session:_on_file_approval(params, request_id)
-  if not request_id or not self.shadow or not self.shadow.workspace_root or not self.thread_id then
-    return
+  if not request_id then return end
+  local decision = "decline"
+  local active = (self.state == "running" or self.state == "waiting_for_command_approval")
+    and self.shadow and self.shadow.workspace_root and self.thread_id and self.turn_id
+    and params and params.threadId == self.thread_id and params.turnId == self.turn_id
+  if active then
+    local safe = no_follow_grant(self.shadow, params.grantRoot)
+    if safe then decision = "acceptForSession" end
   end
-  if params and params.threadId and params.threadId ~= self.thread_id then return end
-  local grant_root = params and params.grantRoot
-  if type(grant_root) == "string" then
-    local ok, normalized = pcall(path.normalize, grant_root, self.shadow.workspace_root)
-    if not ok or not path.is_within(self.shadow.workspace_root, normalized) then return end
-  elseif grant_root ~= nil and grant_root ~= vim.NIL then
-    return
-  end
-  self.transport:respond(request_id, { decision = "acceptForSession" })
+  local ok, err = self.transport:respond(request_id, { decision = decision })
+  if not ok and err then self:_record_error(err) end
   self:_emit("item/fileChange/requestApproval", {
     requestId = request_id,
     request = params,
-    decision = "acceptForSession",
+    decision = decision,
   })
 end
 
@@ -536,7 +673,6 @@ end
 function Session:_on_exit(result)
   if self._expected_exit or self.disposed or not self.started
     or self.state == "closing" then return end
-  local previous_state = self.state
   local err = {
     message = "app-server exited unexpectedly",
     code = result and result.code,
@@ -564,14 +700,33 @@ function Session:_on_exit(result)
     end
   end
   self:_settle_operations(pending, err)
+  self:_cancel_review_queue(err)
   self._settling = false
   if not restarting or self.disposed or self.state ~= "starting" then return end
-  local target = previous_state == "reviewable" and "reviewable" or "idle"
-  self:_start_transport(self.generation, nil, {
-    recovery = true,
-    restarting = true,
-    target = target,
-  })
+  local generation = self.generation
+  local function restart_after_refresh(refresh_err)
+    if not self:_generation_current(generation) or self.state ~= "starting" then return end
+    if refresh_err then
+      self:_fail(refresh_err)
+      return
+    end
+    local target = self.review and #self.review:files() > 0 and "reviewable" or "idle"
+    self:_start_transport(generation, nil, {
+      recovery = true,
+      restarting = true,
+      target = target,
+    })
+  end
+  self:_when_review_idle(function()
+    if not self:_generation_current(generation) or self.state ~= "starting" then return end
+    if self.shadow and self.review and type(self.review.refresh) == "function" then
+      local completed = once(restart_after_refresh)
+      local ok, thrown = pcall(self.review.refresh, self.review, completed)
+      if not ok then completed(error_value(thrown)) end
+    else
+      restart_after_refresh()
+    end
+  end)
 end
 
 function Session:start(callback)
@@ -658,7 +813,8 @@ function Session:send(text, callback)
   callback = public_callback(callback)
   if self:_reject_reentry(callback) then return end
   if self.disposed then callback(state_error("session is disposed")); return end
-  if (self.state ~= "idle" and self.state ~= "reviewable") or self._sending then
+  if (self.state ~= "idle" and self.state ~= "reviewable") or self._sending
+      or self._review_active or #self._review_queue > 0 then
     callback(state_error("send requires an idle or reviewable session"))
     return
   end
@@ -678,7 +834,11 @@ function Session:send(text, callback)
     self._sending = false
     if sync_err then
       sync_err = error_value(sync_err)
-      if sync_err.code == "conflict" then self:_emit("conflict", sync_err) end
+      if sync_err.code == "conflict" then
+        self:_emit("conflict", sync_err)
+        local reconcile_err = self:_reconcile_review_state()
+        if reconcile_err then self:_record_error(reconcile_err) end
+      end
       self:_finish_operation(operation, sync_err)
       return
     end
@@ -819,6 +979,7 @@ function Session:close(callback)
     }, noop)
   end
   self:_settle_operations(pending, { message = "session closing" })
+  self:_cancel_review_queue({ code = "closing", message = "session closing" })
   local remaining = 2
   local first_error
   local function finished(err)
@@ -835,13 +996,15 @@ function Session:close(callback)
   local stopped = once(finished)
   local ok_stop, stop_err = pcall(self.transport.stop, self.transport, stopped)
   if not ok_stop then stopped(error_value(stop_err)) end
-  local cleaned = once(finished)
-  if self.shadow and self.shadow.cleanup then
-    local ok_cleanup, cleanup_err = pcall(self.shadow.cleanup, self.shadow, cleaned)
-    if not ok_cleanup then cleaned(error_value(cleanup_err)) end
-  else
-    cleaned()
-  end
+  self:_when_review_idle(function()
+    local cleaned = once(finished)
+    if self.shadow and self.shadow.cleanup then
+      local ok_cleanup, cleanup_err = pcall(self.shadow.cleanup, self.shadow, cleaned)
+      if not ok_cleanup then cleaned(error_value(cleanup_err)) end
+    else
+      cleaned()
+    end
+  end)
 end
 
 return Session

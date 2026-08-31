@@ -113,6 +113,92 @@ h.test("preserves executable file mode", function()
   h.eq(493, bit.band(uv.fs_stat(target .. "/run.sh").mode, 511))
 end)
 
+h.test("opens copied source files with platform no-follow semantics", function()
+  local source = h.tempdir()
+  local target = h.tempdir() .. "/copy"
+  h.write(source .. "/safe.txt", "safe\n")
+  local source_flags
+  local isolated = fs._new({
+    uv = uv_with({
+      constants = { O_RDONLY = 0 },
+      os_uname = function() return { sysname = "Linux" } end,
+      fs_open = function(filename, flags, mode)
+        if filename == source .. "/safe.txt" then
+          source_flags = flags
+          return uv.fs_open(filename, "r", mode)
+        end
+        return uv.fs_open(filename, flags, mode)
+      end,
+    }),
+  })
+
+  local err = wait_for_callback(function(cb)
+    isolated.copy_tree(source, target, {}, cb)
+  end)
+
+  h.eq(nil, err)
+  h.eq("number", type(source_flags))
+  h.truthy(bit.band(source_flags, 131072) ~= 0)
+end)
+
+h.test("rejects a source file replaced by a symlink before open", function()
+  local source = h.tempdir()
+  local outside = h.tempdir()
+  local target = h.tempdir() .. "/copy"
+  local source_file = source .. "/safe.txt"
+  h.write(source_file, "safe\n")
+  h.write(outside .. "/secret.txt", "secret\n")
+  local replaced = false
+  local isolated = fs._new({
+    uv = uv_with({
+      fs_open = function(filename, flags, mode)
+        if filename == source_file and not replaced then
+          replaced = true
+          assert(uv.fs_rename(source_file, source_file .. ".old"))
+          assert(uv.fs_symlink(outside .. "/secret.txt", source_file))
+        end
+        return uv.fs_open(filename, flags, mode)
+      end,
+    }),
+  })
+
+  local err = wait_for_callback(function(cb)
+    isolated.copy_tree(source, target, {}, cb)
+  end)
+
+  h.truthy(err)
+  h.eq(nil, h.read_optional(target .. "/safe.txt"))
+end)
+
+h.test("rejects a source directory replaced during traversal", function()
+  local source = h.tempdir()
+  local outside = h.tempdir()
+  local target = h.tempdir() .. "/copy"
+  h.mkdir(source .. "/nested")
+  h.write(source .. "/nested/safe.txt", "safe\n")
+  h.write(outside .. "/secret.txt", "secret\n")
+  local replaced = false
+  local isolated = fs._new({
+    uv = uv_with({
+      fs_scandir = function(directory)
+        if directory == source .. "/nested" and not replaced then
+          replaced = true
+          assert(uv.fs_rename(directory, directory .. ".old"))
+          assert(uv.fs_symlink(outside, directory))
+        end
+        return uv.fs_scandir(directory)
+      end,
+    }),
+  })
+
+  local err = wait_for_callback(function(cb)
+    isolated.copy_tree(source, target, {}, cb)
+  end)
+
+  h.truthy(err)
+  h.eq(nil, h.read_optional(target .. "/nested/secret.txt"))
+end)
+
 h.test("safely overlays an existing tree with exact relative exclusions", function()
   local source = h.tempdir()
   local target = h.tempdir() .. "/copy"
@@ -411,4 +497,26 @@ h.test("revalidates cleanup ancestry immediately before deletion", function()
   h.truthy(callback_error)
   h.matches("symlink ancestor", callback_error.message)
   h.eq("outside", h.read(outside .. "/aichatter-session/keep"))
+end)
+
+h.test("refuses cleanup when the recorded session identity was replaced", function()
+  local parent = h.tempdir()
+  local target = parent .. "/aichatter-session"
+  h.mkdir(target)
+  h.write(target .. "/owned", "owned\n")
+  local recorded = assert(uv.fs_lstat(target))
+  assert(uv.fs_rename(target, target .. "-moved"))
+  h.mkdir(target)
+  h.write(target .. "/replacement", "replacement\n")
+
+  local err = wait_for_callback(function(cb)
+    fs.remove_tree_guarded(target, parent, {
+      identity = { dev = recorded.dev, ino = recorded.ino },
+    }, cb)
+  end)
+
+  h.truthy(err)
+  h.matches("identity", err.message)
+  h.eq("replacement\n", h.read(target .. "/replacement"))
+  h.eq("owned\n", h.read(target .. "-moved/owned"))
 end)

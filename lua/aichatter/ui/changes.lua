@@ -77,7 +77,13 @@ function Changes:_invoke(action, row)
   local file = self.files[row]
   local callback = self.callbacks[action]
   if not file or not callback then return false end
-  callback(file)
+  local ok, err = pcall(callback, file)
+  if not ok then
+    return false, {
+      code = "callback_error",
+      message = tostring(err),
+    }
+  end
   return true
 end
 
@@ -147,12 +153,18 @@ function M.new(opts)
     },
     closed = false,
   }, Changes)
-  vim.keymap.set("n", mappings.open, function() self:_cursor_action("open") end,
+  vim.keymap.set("n", "<Plug>(AIChatterChangesOpen)", function() self:_cursor_action("open") end,
     { buffer = bufnr, silent = true })
-  vim.keymap.set("n", mappings.accept, function() self:_cursor_action("accept") end,
+  vim.keymap.set("n", "<Plug>(AIChatterChangesAccept)", function() self:_cursor_action("accept") end,
     { buffer = bufnr, silent = true })
-  vim.keymap.set("n", mappings.reject, function() self:_cursor_action("reject") end,
+  vim.keymap.set("n", "<Plug>(AIChatterChangesReject)", function() self:_cursor_action("reject") end,
     { buffer = bufnr, silent = true })
+  vim.keymap.set("n", mappings.open, "<Plug>(AIChatterChangesOpen)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("n", mappings.accept, "<Plug>(AIChatterChangesAccept)",
+    { buffer = bufnr, silent = true, remap = true })
+  vim.keymap.set("n", mappings.reject, "<Plug>(AIChatterChangesReject)",
+    { buffer = bufnr, silent = true, remap = true })
   vim.keymap.set("n", "<LeftMouse>", function() self:_mouse_action() end,
     { buffer = bufnr, silent = true })
   return self

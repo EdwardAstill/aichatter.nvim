@@ -439,6 +439,11 @@ function M.session_fixture(opts)
       self.cleanup_count = self.cleanup_count + 1
       callback()
     end,
+    validate_grant_root = function(self, value)
+      value = value or self.workspace_root
+      return value == self.workspace_root
+        or require("aichatter.path").is_within(self.workspace_root, value)
+    end,
   }
   local events = {}
   local context = opts.context or Context.new(shadow.project_root)

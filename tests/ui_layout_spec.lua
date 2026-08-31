@@ -127,6 +127,126 @@ h.test("prompts once for a command approval that arrived while hidden", function
   ui:close()
 end)
 
+h.test("toggle hides and restores composer and candidate draft buffers", function()
+  local review = h.fake_review({
+    path = "main.lua",
+    base = "old\n",
+    candidate = "new\n",
+  })
+  local session = {
+    state = "reviewable",
+    transcript = {},
+    context = { files = {}, selections = {} },
+    review = review,
+    emit = function() end,
+  }
+  function session:send() end
+  local ui = require("aichatter.ui").new(session, {})
+  ui:open()
+  vim.api.nvim_buf_set_lines(ui.composer.bufnr, 0, -1, false, { "draft prompt" })
+  ui:_open_review(review.record)
+  h.invoke_mapping(ui.diff_view.bufnr, "n", "e")
+  local composer = ui.composer.bufnr
+  local candidate = ui.diff_view.candidate_bufnr
+  vim.api.nvim_buf_set_lines(candidate, 0, -1, false, { "local candidate draft" })
+  vim.bo[candidate].modified = true
+
+  ui:toggle()
+
+  h.truthy(vim.api.nvim_buf_is_valid(composer))
+  h.truthy(vim.api.nvim_buf_is_valid(candidate))
+  h.eq({ "draft prompt" }, vim.api.nvim_buf_get_lines(composer, 0, -1, false))
+  h.eq({ "local candidate draft" }, vim.api.nvim_buf_get_lines(candidate, 0, -1, false))
+  h.truthy(vim.bo[candidate].modified)
+
+  ui:toggle()
+
+  h.eq(composer, ui.composer.bufnr)
+  h.eq(candidate, ui.diff_view.candidate_bufnr)
+  h.eq({ "draft prompt" }, vim.api.nvim_buf_get_lines(ui.composer.bufnr, 0, -1, false))
+  h.eq({ "local candidate draft" },
+    vim.api.nvim_buf_get_lines(ui.diff_view.candidate_bufnr, 0, -1, false))
+  ui:close()
+end)
+
+h.test("refuses to switch review files away from a modified candidate draft", function()
+  local records = {
+    {
+      path = "first.lua",
+      base = "old\n",
+      candidate = "new\n",
+    },
+    {
+      path = "second.lua",
+      base = "before\n",
+      candidate = "after\n",
+    },
+  }
+  for _, record in ipairs(records) do
+    record.hunks = require("aichatter.diff").hunks(record.base, record.candidate)
+  end
+  local review = { records = records }
+  function review:files() return self.records end
+  function review:edit_candidate(_, _, callback) callback() end
+  local notified
+  local session = {
+    state = "reviewable",
+    transcript = {},
+    context = { files = {}, selections = {} },
+    review = review,
+    emit = function() end,
+  }
+  function session:send() end
+  local ui = require("aichatter.ui").new(session, {
+    notify = function(message) notified = message end,
+  })
+  ui:open()
+  ui:_open_review(records[1])
+  h.invoke_mapping(ui.diff_view.bufnr, "n", "e")
+  local candidate = ui.diff_view.candidate_bufnr
+  vim.api.nvim_buf_set_lines(candidate, 0, -1, false, { "do not discard" })
+  vim.bo[candidate].modified = true
+
+  ui:_open_review(records[2])
+
+  h.eq("first.lua", ui.diff_view.path)
+  h.eq(candidate, ui.diff_view.candidate_bufnr)
+  h.eq({ "do not discard" }, vim.api.nvim_buf_get_lines(candidate, 0, -1, false))
+  h.truthy(vim.bo[candidate].modified)
+  h.matches("modified candidate", notified or "")
+  ui:close()
+end)
+
+h.test("review queue actions go through the session coordinator", function()
+  local review = h.fake_review({
+    path = "main.lua",
+    base = "old\n",
+    candidate = "new\n",
+  })
+  local calls = {}
+  local session = {
+    state = "reviewable",
+    transcript = {},
+    context = { files = {}, selections = {} },
+    review = review,
+    emit = function() end,
+  }
+  function session:send() end
+  function session:review_action(method, path, callback)
+    calls[#calls + 1] = { method = method, path = path }
+    callback()
+    return true
+  end
+  local ui = require("aichatter.ui").new(session, {})
+  ui:open()
+
+  ui:_review_action("accept_file", review.record)
+
+  h.eq({ { method = "accept_file", path = "main.lua" } }, calls)
+  h.eq({}, review.accepted_hunks)
+  ui:close()
+end)
+
 h.test("reconciles an open diff and clean candidate after a refreshed turn", function()
   local review = h.fake_review({
     path = "main.lua",
@@ -208,7 +328,7 @@ h.test("preserves and marks a modified candidate after an errored queue mutation
 end)
 
 h.test("rejects tiny screens without leaking windows buffers or focus", function()
-  dimensions(20, 5, function()
+  dimensions(20, 7, function()
     local main_win = vim.api.nvim_get_current_win()
     local windows = #vim.api.nvim_tabpage_list_wins(0)
     local buffers = #vim.api.nvim_list_bufs()

@@ -1,6 +1,26 @@
 local h = require("tests.helpers")
 local Transport = require("aichatter.transport")
 
+local function injected_transport()
+  local launched
+  local writes = {}
+  local process = {
+    is_closing = function() return false end,
+    write = function(_, value) writes[#writes + 1] = value end,
+  }
+  local transport = Transport.new({
+    cmd = { "this-command-must-not-run" },
+    launcher = function(cmd, opts, on_exit)
+      launched = { cmd = cmd, opts = opts, on_exit = on_exit }
+      return process
+    end,
+    scheduler = function(callback) callback() end,
+  })
+  transport:start(function(err) h.eq(nil, err) end)
+  launched.opts.stdout(nil, '{"id":1,"result":{}}\n')
+  return transport, launched, writes
+end
+
 h.test("uses an injected process launcher and scheduler", function()
   local launched
   local writes = {}
@@ -33,6 +53,64 @@ h.test("uses an injected process launcher and scheduler", function()
   launched.opts.stdout(nil, '{"id":1,"result":{}}\n')
   h.eq(nil, started)
   h.eq("initialized", vim.json.decode(writes[2]).method)
+end)
+
+h.test("reports malformed JSON and keeps parsing following frames", function()
+  local transport, launched = injected_transport()
+  local diagnostics = {}
+  local result
+  transport:on("error", function(err)
+    diagnostics[#diagnostics + 1] = err
+  end)
+  transport:request("account/read", {}, function(err, value)
+    h.eq(nil, err)
+    result = value
+  end)
+
+  launched.opts.stdout(nil, 'not-json\n{"id":2,"result":{"ok":true}}\n')
+
+  h.eq("malformed_json", diagnostics[1].code)
+  h.matches("malformed JSON", diagnostics[1].message)
+  h.eq(true, result.ok)
+end)
+
+h.test("reports unknown responses and notifications as diagnostics", function()
+  local transport, launched = injected_transport()
+  local diagnostics = {}
+  transport:on("error", function(err)
+    diagnostics[#diagnostics + 1] = err
+  end)
+
+  launched.opts.stdout(nil, '{"id":99,"result":{}}\n')
+  launched.opts.stdout(nil, '{"method":"mystery/event","params":{"value":1}}\n')
+
+  h.eq("unknown_response", diagnostics[1].code)
+  h.eq(99, diagnostics[1].id)
+  h.eq("unknown_notification", diagnostics[2].code)
+  h.eq("mystery/event", diagnostics[2].method)
+end)
+
+h.test("protects listener dispatch and reports thrown listener diagnostics", function()
+  local transport, launched = injected_transport()
+  local diagnostics = {}
+  local delivered = 0
+  transport:on("error", function(err)
+    diagnostics[#diagnostics + 1] = err
+  end)
+  transport:on("item/agentMessage/delta", function()
+    error("listener exploded")
+  end)
+  transport:on("item/agentMessage/delta", function(params)
+    delivered = delivered + #(params.delta or "")
+  end)
+
+  launched.opts.stdout(nil,
+    '{"method":"item/agentMessage/delta","params":{"delta":"ok"}}\n')
+
+  h.eq(2, delivered)
+  h.eq("listener_error", diagnostics[1].code)
+  h.eq("item/agentMessage/delta", diagnostics[1].method)
+  h.matches("listener exploded", diagnostics[1].message)
 end)
 
 h.test("initializes and correlates responses from a real child process", function()

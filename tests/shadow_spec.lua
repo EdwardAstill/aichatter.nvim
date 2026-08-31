@@ -51,6 +51,25 @@ h.test("creates separate baseline and workspace with unsaved buffer content", fu
   h.eq("return 1\n", h.read(root .. "/main.lua"))
 end)
 
+h.test("canonicalizes a symlinked temp parent and creates a private random session", function()
+  local root = h.tempdir()
+  local parent_container = h.tempdir()
+  local actual_parent = parent_container .. "/actual"
+  local linked_parent = parent_container .. "/linked"
+  h.mkdir(actual_parent)
+  h.symlink(actual_parent, linked_parent)
+  h.write(root .. "/main.lua", "return 1\n")
+
+  local shadow = h.create_shadow(root, { temp_parent = linked_parent })
+  local basename = vim.fs.basename(shadow.session_root)
+
+  h.truthy(path.is_within(actual_parent, shadow.session_root))
+  h.eq(actual_parent, shadow._temp_parent)
+  h.eq(448, bit.band(assert(uv.fs_lstat(shadow.session_root)).mode, 511))
+  h.matches("^aichatter%-%x+$", basename)
+  h.falsy(basename:match("^aichatter%-%d+%-%d+$"))
+end)
+
 h.test("uses exact independent-clone arguments and overlays dirty untracked and ignored files", function()
   local root = h.git_project({
     [".gitignore"] = "ignored.bin\n",
@@ -85,6 +104,42 @@ h.test("uses exact independent-clone arguments and overlays dirty untracked and 
   h.eq("dirty\n", h.read(root .. "/tracked.txt"))
 end)
 
+h.test("discovers a real Git root from a nested working directory", function()
+  local root = h.git_project({ ["nested/child.txt"] = "child\n" })
+
+  local shadow = h.create_shadow(root .. "/nested")
+
+  h.eq(root, shadow.project_root)
+  h.eq("child\n", h.read(shadow.workspace_root .. "/nested/child.txt"))
+end)
+
+h.test("clones a real linked worktree into independent Git metadata", function()
+  local root = h.git_project({ ["tracked.txt"] = "tracked\n" })
+  local linked = h.tempdir() .. "/linked-worktree"
+  local added = vim.system({ "git", "-C", root, "worktree", "add", "--detach", linked },
+    { text = true }):wait()
+  h.eq(0, added.code)
+
+  local shadow = h.create_shadow(linked)
+
+  h.eq(linked, shadow.project_root)
+  h.eq("directory", assert(uv.fs_lstat(shadow.workspace_root .. "/.git")).type)
+  h.eq("tracked\n", h.read(shadow.workspace_root .. "/tracked.txt"))
+end)
+
+h.test("real local clone objects do not share device and inode identity", function()
+  local root = h.git_project({ ["tracked.txt"] = "tracked\n" })
+  local object = vim.trim(vim.system({ "git", "-C", root, "rev-parse", "HEAD" },
+    { text = true }):wait().stdout)
+  local relative = "objects/" .. object:sub(1, 2) .. "/" .. object:sub(3)
+
+  local shadow = h.create_shadow(root)
+  local source = assert(uv.fs_stat(root .. "/.git/" .. relative))
+  local cloned = assert(uv.fs_stat(shadow.workspace_root .. "/.git/" .. relative))
+
+  h.falsy(source.dev == cloned.dev and source.ino == cloned.ino)
+end)
+
 h.test("default buffer overlay preserves an unsaved missing final newline", function()
   local root = h.tempdir()
   local source = root .. "/note.txt"
@@ -103,6 +158,23 @@ h.test("default buffer overlay preserves an unsaved missing final newline", func
   h.eq(416, bit.band(uv.fs_stat(shadow.workspace_root .. "/note.txt").mode, 511))
   h.eq("disk\n", h.read(source))
   h.truthy(vim.bo[bufnr].modified)
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+end)
+
+h.test("default buffer overlay preserves a loaded zero-byte file exactly", function()
+  local root = h.tempdir()
+  local source = root .. "/empty.txt"
+  h.write(source, "")
+  local bufnr = vim.fn.bufadd(source)
+  vim.fn.bufload(bufnr)
+  h.eq({ "" }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+  h.truthy(vim.bo[bufnr].endofline)
+
+  local shadow = h.create_shadow(root)
+
+  h.eq("", h.read(shadow.baseline_root .. "/empty.txt"))
+  h.eq("", h.read(shadow.workspace_root .. "/empty.txt"))
+  h.eq("", h.read(source))
   vim.api.nvim_buf_delete(bufnr, { force = true })
 end)
 
@@ -224,6 +296,28 @@ h.test("retains an absolute excluded proposal named through the project root ali
   end
 end)
 
+h.test("canonicalizes relative exclusions and rejects escapes", function()
+  local root = h.tempdir()
+  h.mkdir(root .. "/dir")
+  h.write(root .. "/proposal.txt", "shadow proposal\n")
+  h.write(root .. "/ordinary.txt", "old\n")
+  local shadow = h.create_shadow(root)
+  h.write(root .. "/proposal.txt", "live proposal\n")
+  h.write(root .. "/ordinary.txt", "fresh\n")
+
+  local err = wait_error(function(callback)
+    shadow:sync_live({ ["dir/../proposal.txt"] = true }, callback)
+  end)
+  h.eq(nil, err)
+  h.eq("shadow proposal\n", h.read(shadow.workspace_root .. "/proposal.txt"))
+  h.eq("fresh\n", h.read(shadow.workspace_root .. "/ordinary.txt"))
+
+  local escape = wait_error(function(callback)
+    shadow:sync_live({ ["../outside"] = true }, callback)
+  end)
+  h.eq("outside_root", escape.code)
+end)
+
 h.test("sync_live updates both trees while retaining excluded proposals", function()
   local root = h.tempdir()
   h.write(root .. "/proposal.txt", "shadow proposal\n")
@@ -336,15 +430,16 @@ h.test("cleanup cancels outstanding sync and removes the session exactly once", 
   local remove_calls = 0
   local hold_copies = false
   local fake_fs = {
-    copy_tree = function(_, _, opts, callback)
+    copy_tree = function(_, target, opts, callback)
       if hold_copies then
         pending = { cancel = opts.cancel, callback = callback }
       else
+        h.mkdir(target)
         callback()
       end
     end,
     atomic_write = function(_, _, _, callback) callback() end,
-    remove_tree_guarded = function(_, _, callback)
+    remove_tree_guarded = function(_, _, _, callback)
       remove_calls = remove_calls + 1
       callback()
     end,
@@ -385,9 +480,12 @@ end)
 local function fake_shadow(buffer_provider)
   local remove_calls = 0
   local fake_fs = {
-    copy_tree = function(_, _, _, callback) callback() end,
+    copy_tree = function(_, target, _, callback)
+      h.mkdir(target)
+      callback()
+    end,
     atomic_write = function(_, _, _, callback) callback() end,
-    remove_tree_guarded = function(_, _, callback)
+    remove_tree_guarded = function(_, _, _, callback)
       remove_calls = remove_calls + 1
       callback()
     end,

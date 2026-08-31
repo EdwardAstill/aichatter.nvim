@@ -5,6 +5,11 @@ local function marks(view)
     view.bufnr, view.namespace, 0, -1, { details = true })
 end
 
+local function maparg(bufnr, mode, lhs)
+  vim.api.nvim_set_current_buf(bufnr)
+  return vim.fn.maparg(lhs, mode, false, true)
+end
+
 h.test("renders unified context with green additions and red deletions", function()
   local review = h.fake_review({
     path = "main.lua",
@@ -20,6 +25,19 @@ h.test("renders unified context with green additions and red deletions", functio
   h.truthy(h.has_highlight(marks(view), "AIChatterDiffDelete"))
   h.truthy(h.has_highlight(marks(view), "AIChatterDiffAdd"))
   h.falsy(vim.bo[view.bufnr].modifiable)
+  view:close()
+end)
+
+h.test("maps review defaults through documented plug mappings", function()
+  local review = h.fake_review({ path = "main.lua", base = "old\n", candidate = "new\n" })
+  local view = require("aichatter.ui.diff").open(review, "main.lua")
+
+  h.eq("<Plug>(AIChatterReviewAccept)", maparg(view.bufnr, "n", "a").rhs)
+  h.eq("<Plug>(AIChatterReviewReject)", maparg(view.bufnr, "n", "r").rhs)
+  h.eq("<Plug>(AIChatterReviewEdit)", maparg(view.bufnr, "n", "e").rhs)
+  h.truthy(maparg(view.bufnr, "n", "<Plug>(AIChatterReviewAccept)").callback ~= nil)
+  h.truthy(maparg(view.bufnr, "n", "<Plug>(AIChatterReviewReject)").callback ~= nil)
+  h.truthy(maparg(view.bufnr, "n", "<Plug>(AIChatterReviewEdit)").callback ~= nil)
   view:close()
 end)
 
@@ -70,6 +88,39 @@ h.test("rerenders an accept conflict and lets navigation reject it", function()
   view:close()
 end)
 
+h.test("renders textual deletions with red lines and file-level actions", function()
+  local review = h.fake_review({
+    path = "removed.txt",
+    base = "one\ntwo\n",
+    candidate = "",
+    candidate_exists = false,
+    file_level = true,
+    binary = false,
+  })
+  review.accepted_files = {}
+  review.rejected_files = {}
+  function review:accept_file(path, callback)
+    self.accepted_files[#self.accepted_files + 1] = path
+    callback()
+  end
+  function review:reject_file(path, callback)
+    self.rejected_files[#self.rejected_files + 1] = path
+    callback()
+  end
+  local view = require("aichatter.ui.diff").open(review, "removed.txt")
+  local text = h.buffer_text(view.bufnr)
+
+  h.matches("%-one", text)
+  h.matches("%-two", text)
+  h.truthy(h.has_highlight(marks(view), "AIChatterDiffDelete"))
+  h.invoke_mapping(view.bufnr, "n", "a")
+  h.invoke_mapping(view.bufnr, "n", "r")
+
+  h.eq({ "removed.txt" }, review.accepted_files)
+  h.eq({ "removed.txt" }, review.rejected_files)
+  view:close()
+end)
+
 h.test("writes a complete candidate through a non-live acwrite name", function()
   local review = h.fake_review({
     path = "lua/main.lua",
@@ -93,6 +144,26 @@ h.test("writes a complete candidate through a non-live acwrite name", function()
   h.eq({ "complete\ncandidate\n" }, review.edited_candidates)
   h.falsy(vim.bo[candidate].modified)
   h.matches("%+complete", h.buffer_text(view.bufnr))
+  view:close()
+end)
+
+h.test("writes a zero-byte candidate without adding a newline", function()
+  local review = h.fake_review({
+    path = "empty.lua",
+    base = "old\n",
+    candidate = "new\n",
+  })
+  local view = require("aichatter.ui.diff").open(review, "empty.lua")
+  h.invoke_mapping(view.bufnr, "n", "e")
+  local candidate = view.candidate_bufnr
+  vim.api.nvim_buf_set_lines(candidate, 0, -1, false, { "" })
+  vim.bo[candidate].endofline = true
+  vim.bo[candidate].modified = true
+  vim.api.nvim_set_current_buf(candidate)
+  vim.cmd("write")
+
+  h.eq({ "" }, review.edited_candidates)
+  h.falsy(vim.bo[candidate].modified)
   view:close()
 end)
 
